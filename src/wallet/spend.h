@@ -223,6 +223,12 @@ util::Result<CreatedTransactionResult> CreateTransaction(CWallet& wallet, const 
  * calling CreateTransaction();
  */
 bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet, int& nChangePosInOut, bilingual_str& error, bool lockUnspents, const std::set<int>& setSubtractFeeFromOutputs, CCoinControl);
+
+/* Create a sidechain withdrawal to parent chain */
+bool CreateWithdrawal(CWallet& wallet, const CScript& scriptWithdrawalData, const CAmount& nAmount, const CAmount& nFee, const CAmount& nMainchainFee, const std::string& strDestination, const std::string& strRefundDestination, std::string& strFail, uint256& txid);
+
+bool CreateWithdrawalRefundRequest(CWallet& wallet, const uint256& id, const std::vector<unsigned char>& vch, std::string& strFail, uint256& txid);
+
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_SPEND_H

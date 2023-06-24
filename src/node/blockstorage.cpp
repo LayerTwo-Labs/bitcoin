@@ -11,7 +11,6 @@
 #include <hash.h>
 #include <logging.h>
 #include <kernel/chainparams.h>
-#include <pow.h>
 #include <reverse_iterator.h>
 #include <shutdown.h>
 #include <signet.h>
@@ -31,8 +30,8 @@ std::atomic_bool fReindex(false);
 bool CBlockIndexWorkComparator::operator()(const CBlockIndex* pa, const CBlockIndex* pb) const
 {
     // First sort by most total work, ...
-    if (pa->nChainWork > pb->nChainWork) return false;
-    if (pa->nChainWork < pb->nChainWork) return true;
+    if (pa->nHeight > pb->nHeight) return false;
+    if (pa->nHeight < pb->nHeight) return true;
 
     // ... then by earliest time received, ...
     if (pa->nSequenceId < pb->nSequenceId) return false;
@@ -91,6 +90,10 @@ CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockInde
     }
     CBlockIndex* pindexNew = &(*mi).second;
 
+    // Add mainchain block hash to index
+    uint256 hashMainchainBlock = block.hashMainchainBlock;
+    pindexNew->hashMainchainBlock = hashMainchainBlock;
+
     // We assign the sequence id to blocks only when the full data is available,
     // to avoid miners withholding blocks but broadcasting headers, to get a
     // competitive advantage.
@@ -104,9 +107,8 @@ CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockInde
         pindexNew->BuildSkip();
     }
     pindexNew->nTimeMax = (pindexNew->pprev ? std::max(pindexNew->pprev->nTimeMax, pindexNew->nTime) : pindexNew->nTime);
-    pindexNew->nChainWork = (pindexNew->pprev ? pindexNew->pprev->nChainWork : 0) + GetBlockProof(*pindexNew);
     pindexNew->RaiseValidity(BLOCK_VALID_TREE);
-    if (best_header == nullptr || best_header->nChainWork < pindexNew->nChainWork) {
+    if (best_header == nullptr || best_header->nHeight < pindexNew->nHeight) {
         best_header = pindexNew;
     }
 
@@ -236,7 +238,7 @@ void BlockManager::UpdatePruneLock(const std::string& name, const PruneLockInfo&
     m_prune_locks[name] = lock_info;
 }
 
-CBlockIndex* BlockManager::InsertBlockIndex(const uint256& hash)
+CBlockIndex* BlockManager::InsertBlockIndex(const uint256& hash, const uint256& hashMainBlock)
 {
     AssertLockHeld(cs_main);
 
@@ -249,12 +251,17 @@ CBlockIndex* BlockManager::InsertBlockIndex(const uint256& hash)
     if (inserted) {
         pindex->phashBlock = &((*mi).first);
     }
+
+    // Also track by mainchain commitment block hash
+    if (!hashMainBlock.IsNull())
+        mapBlockMainHashIndex[hashMainBlock] = pindex;
+
     return pindex;
 }
 
 bool BlockManager::LoadBlockIndex(const Consensus::Params& consensus_params)
 {
-    if (!m_block_tree_db->LoadBlockIndexGuts(consensus_params, [this](const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return this->InsertBlockIndex(hash); })) {
+    if (!m_block_tree_db->LoadBlockIndexGuts(consensus_params, [this](const uint256& hash, const uint256& hashMainBlock) EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return this->InsertBlockIndex(hash, hashMainBlock); })) {
         return false;
     }
 
@@ -265,7 +272,6 @@ bool BlockManager::LoadBlockIndex(const Consensus::Params& consensus_params)
 
     for (CBlockIndex* pindex : vSortedByHeight) {
         if (ShutdownRequested()) return false;
-        pindex->nChainWork = (pindex->pprev ? pindex->pprev->nChainWork : 0) + GetBlockProof(*pindex);
         pindex->nTimeMax = (pindex->pprev ? std::max(pindex->pprev->nTimeMax, pindex->nTime) : pindex->nTime);
 
         // We can link the chain of blocks for which we've received transactions at some point, or
@@ -753,11 +759,6 @@ bool ReadBlockFromDisk(CBlock& block, const FlatFilePos& pos, const Consensus::P
         filein >> block;
     } catch (const std::exception& e) {
         return error("%s: Deserialize or I/O error - %s at %s", __func__, e.what(), pos.ToString());
-    }
-
-    // Check the header
-    if (!CheckProofOfWork(block.GetHash(), block.nBits, consensusParams)) {
-        return error("ReadBlockFromDisk: Errors in block header at %s", pos.ToString());
     }
 
     // Signet only: check block solution

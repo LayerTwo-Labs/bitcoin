@@ -220,6 +220,17 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "addpeeraddress", 1, "port"},
     { "addpeeraddress", 2, "tried"},
     { "stop", 0, "wait" },
+    // Drivechain
+    { "createwithdrawal", 2, "namount"},
+    { "createwithdrawal", 3, "nfee"},
+    { "createwithdrawal", 4, "nmainchainfee"},
+    { "createwithdrawaldata", 2, "namount"},
+    { "createwithdrawaldata", 3, "nmainchainfee"},
+    //{ "getaveragemainchainfees", 0, "blockcount" },
+    //{ "getaveragemainchainfees", 1, "startheight" },
+    { "refreshbmm", 0, "amount" },
+    { "refreshbmm", 1, "createnew" },
+    //{ "getmainchainblockhash", 0, "height" },
 };
 // clang-format on
 

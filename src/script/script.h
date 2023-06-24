@@ -10,6 +10,7 @@
 #include <crypto/common.h>
 #include <prevector.h>
 #include <serialize.h>
+#include <uint256.h>
 
 #include <assert.h>
 #include <climits>
@@ -533,6 +534,15 @@ public:
     bool IsPayToScriptHash() const;
     bool IsPayToWitnessScriptHash() const;
     bool IsWitnessProgram(int& version, std::vector<unsigned char>& program) const;
+
+    /** Script formats for Drivechains */
+    bool IsWithdrawalBundleFailCommit(uint256& hashWithdrawalBundle) const;
+    bool IsWithdrawalBundleSpentCommit(uint256& hashWithdrawalBundle) const;
+    bool IsWithdrawalRefundRequest(uint256& wtID, std::vector<unsigned char>& vchSig) const;
+    bool IsPrevBlockCommit(uint256& hashPrevMain, uint256& hashPrevSide) const;
+    bool IsWithdrawalBundleHashCommit(uint256& hashWithdrawalBundle) const;
+    bool IsBlockVersionCommit(int32_t& nVersion) const;
+    bool IsSidechainObj(std::vector<unsigned char>& vch) const;
 
     /** Called by IsStandardTx and P2SH/BIP62 VerifyScript (which makes it consensus-critical). */
     bool IsPushOnly(const_iterator pc) const;

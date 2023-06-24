@@ -24,6 +24,7 @@
 #include <policy/policy.h>
 #include <script/script_error.h>
 #include <shutdown.h>
+#include <sidechain.h>
 #include <sync.h>
 #include <txdb.h>
 #include <txmempool.h> // For CTxMemPool::cs
@@ -37,6 +38,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdint.h>
@@ -45,6 +47,8 @@
 #include <utility>
 #include <vector>
 
+class BMMCache;
+class CSidechainTreeDB;
 class Chainstate;
 class CBlockTreeDB;
 class CTxMemPool;
@@ -70,7 +74,7 @@ static const int DEFAULT_STOPATHEIGHT = 0;
 /** Block files containing a block-height within MIN_BLOCKS_TO_KEEP of ActiveChain().Tip() will not be pruned. */
 static const unsigned int MIN_BLOCKS_TO_KEEP = 288;
 static const signed int DEFAULT_CHECKBLOCKS = 6;
-static constexpr int DEFAULT_CHECKLEVEL{3};
+static constexpr int DEFAULT_CHECKLEVEL{4};
 // Require that user allocate at least 550 MiB for block & undo files (blk???.dat and rev???.dat)
 // At 1MB per block, 288 blocks = 288MB.
 // Add 15% for Undo data = 331MB
@@ -337,7 +341,7 @@ public:
 /** Functions for validating blocks and updating the block tree */
 
 /** Context-independent validity checks */
-bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true, bool fCheckMerkleRoot = true);
+bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckMerkleRoot = true, bool fCheckBMM = true);
 
 /** Check a block is completely valid from start to finish (only works on top of our current best block) */
 bool TestBlockValidity(BlockValidationState& state,
@@ -346,8 +350,9 @@ bool TestBlockValidity(BlockValidationState& state,
                        const CBlock& block,
                        CBlockIndex* pindexPrev,
                        const std::function<NodeClock::time_point()>& adjusted_time_callback,
-                       bool fCheckPOW = true,
-                       bool fCheckMerkleRoot = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+                       bool fCheckMerkleRoot = true,
+                       bool fCheckBMM = false,
+                       bool fReorg = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 /** Check with the proof of work on each blockheader matches the value in nBits */
 bool HasValidProofOfWork(const std::vector<CBlockHeader>& headers, const Consensus::Params& consensusParams);
@@ -462,8 +467,6 @@ protected:
     int32_t nBlockSequenceId GUARDED_BY(::cs_main) = 1;
     /** Decreasing counter (used by subsequent preciousblock calls). */
     int32_t nBlockReverseSequenceId = -1;
-    /** chainwork for the last block that preciousblock has been applied to. */
-    arith_uint256 nLastPreciousChainwork = 0;
 
     /**
      * The ChainState Mutex
@@ -697,19 +700,10 @@ public:
     DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
-                      CCoinsViewCache& view, bool fJustCheck = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+                      CCoinsViewCache& view, bool fJustCheck = false, bool fCheckBMM = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     // Apply the effects of a block disconnection on the UTXO set.
     bool DisconnectTip(BlockValidationState& state, DisconnectedBlockTransactions* disconnectpool) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
-
-    // Manual block validity manipulation:
-    /** Mark a block as precious and reorganize.
-     *
-     * May not be called in a validationinterface callback.
-     */
-    bool PreciousBlock(BlockValidationState& state, CBlockIndex* pindex)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_chainstate_mutex)
-        LOCKS_EXCLUDED(::cs_main);
 
     /** Mark a block as invalid. */
     bool InvalidateBlock(BlockValidationState& state, CBlockIndex* pindex)
@@ -953,7 +947,6 @@ public:
     const CChainParams& GetParams() const { return m_options.chainparams; }
     const Consensus::Params& GetConsensus() const { return m_options.chainparams.GetConsensus(); }
     bool ShouldCheckBlockIndex() const { return *Assert(m_options.check_block_index); }
-    const arith_uint256& MinimumChainWork() const { return *Assert(m_options.minimum_chain_work); }
     const uint256& AssumedValidBlock() const { return *Assert(m_options.assumed_valid_block); }
 
     /**
@@ -1198,5 +1191,110 @@ bool IsBIP30Repeat(const CBlockIndex& block_index);
 
 /** Identifies blocks which coinbase output was subsequently overwritten in the UTXO set (see BIP30) */
 bool IsBIP30Unspendable(const CBlockIndex& block_index);
+
+
+/** Global variable that points to the active sidechain tree (protected by cs_main) */
+extern std::unique_ptr<CSidechainTreeDB> psidechaintree;
+
+/** Sidechain keys */
+static const char* const SIDECHAIN_CHANGE_KEY = "09c1fbf0ad3047fb825e0bc5911528596b7d7f49";
+static const char* const SIDECHAIN_TEST_SCRIPT_HEX = "76a914497f7d6b59281591c50b5e82fb4730adf0fbc10988ac";
+
+static const bool DEFAULT_VERIFY_WITHDRAWAL_BUNDLE_ACCEPT_BLOCK = true;
+
+extern BMMCache bmmCache;
+
+extern std::mutex mainBlockCacheMutex;
+extern std::mutex mainBlockCacheReorgMutex;
+
+extern const std::string strRefundMessageMagic;
+
+extern std::map<uint256, CBlockIndex*> mapBlockMainHashIndex;
+
+/** Produce withdrawal bundle status commitment for a block */
+CScript GenerateWithdrawalBundleFailCommit(const uint256& hashWithdrawalBundle);
+CScript GenerateWithdrawalBundleSpentCommit(const uint256& hashWithdrawalBundle);
+
+/** Produce withdrawal refund request */
+CScript GenerateWithdrawalRefundRequest(const uint256& id, const std::vector<unsigned char>& vchSig);
+
+/** Produce prev block commit (prev mainchain & prev sidechain block hash) */
+CScript GeneratePrevBlockCommit(const uint256& hashPrevMain, const uint256& hashPrevSide);
+
+/** Produce current Withdrawal Bundle hash commit */
+CScript GenerateWithdrawalBundleHashCommit(const uint256& hashWithdrawalBundle);
+
+/** Produce block version commit */
+CScript GenerateBlockVersionCommit(const int32_t nVersion);
+
+/** Verify the status of withdrawal to refund & check refund signature */
+bool VerifyWithdrawalRefundRequest(const uint256& id, const std::vector<unsigned char>& vchSig, SidechainWithdrawal& withdrawal);
+
+
+/** Dump the BMM caches to disk. */
+void DumpBMMCache();
+
+/** Load the BMM caches from disk. */
+void LoadBMMCache();
+
+/** Dump the cache of mainchain block hashes to disk */
+void DumpMainBlockCache();
+
+/** Load the cache of mainchain block hashes from disk */
+void LoadMainBlockCache();
+
+/** Dump the cache of users withdrawal IDs */
+void DumpWithdrawalIDCache();
+
+/** Read the cache of users withdrawal IDs */
+void LoadWithdrawalIDCache();
+
+/** Create joined Withdrawal Bundle to be sent to the mainchain */
+bool CreateWithdrawalBundleTx(int nHeight, CTransactionRef& withdrawalBundleTx, CTransactionRef& withdrawalBundleDataTx, bool fReplicationCheck = false, bool fCheckUnique = false);
+
+/**
+ * If there are any Withdrawal Bundle (s) (note the limit per block is 1) verify
+ * it, and optionally replicate it. This function will return by reference a
+ * vector of withdrawals spent by the Withdrawal Bundle if it has been validated
+ * so that ConnectBlock can update their status.
+ */
+bool VerifyWithdrawalBundles(std::string& strFail, int nHeight, const std::vector<CTransactionRef>& vtx, std::vector<SidechainWithdrawal>& vWithdrawal, uint256& hashWithdrawalBundle, uint256& hashWithdrawalBundleID, bool fReplicate = false);
+
+/** Sort deposits by CTIP spend order */
+bool SortDeposits(const std::vector<SidechainDeposit>& vDeposit, std::vector<SidechainDeposit>& vDepositSorted);
+
+/** Check for RPC connection to mainchain node */
+bool CheckMainchainConnection();
+
+/** Enable or disable networking and print log message */
+void SetNetworkActive(bool fActive, const std::string& strReason = "");
+
+/** Get the mainchain block hash from the BMM block's critical h* proof hex */
+uint256 GetMainBlockHash(const CBlockHeader& block);
+
+/**
+ * Update the BMM cache of mainchain blocks. Detect mainchain reorg & return
+ * list of disconnected mainchain blocks if a reorg was detected.
+ */
+bool UpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected);
+
+/* Verify the contents of the mainchain block cache with the mainchain */
+bool VerifyMainBlockCache(std::string& strError);
+
+/** Disconnect blocks with a BMM commit from an orphan mainchain block */
+void HandleMainchainReorg(const std::vector<uint256>& vOrphan);
+
+CScript EncodeWithdrawalFees(const CAmount& amount);
+
+bool DecodeWithdrawalFees(const CScript& script, CAmount& amount);
+
+uint256 GetWithdrawalRefundMessageHash(const uint256& id);
+
+/** Verify BMM for this block with the mainchain */
+bool VerifyBMM(const CBlock& block);
+
+/** Verify deposit with the mainchain */
+bool VerifyDeposit(const uint256& hashMainBlock, const uint256& txid, const int nTx);
+
 
 #endif // BITCOIN_VALIDATION_H

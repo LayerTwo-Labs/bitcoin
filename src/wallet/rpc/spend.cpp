@@ -1723,4 +1723,85 @@ RPCHelpMan walletcreatefundedpsbt()
 },
     };
 }
+
+RPCHelpMan createwithdrawal()
+{
+    return RPCHelpMan{"createwithdrawal",
+        "\n\n",
+        {
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "."},
+            {"refundaddress", RPCArg::Type::STR, RPCArg::Optional::NO, "."},
+            {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "."},
+            {"fee", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "."},
+            {"mainchainfee", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "."},
+            {"datascript", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR, "txid", "."},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("createwithdrawal", "")
+            + HelpExampleRpc("createwithdrawal", "")
+        },
+    [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+
+    LOCK(pwallet->cs_wallet);
+
+    // Make sure the results are valid at least up to the most recent block
+    // the user could have gotten from another RPC command prior to now
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    CTxDestination dest = DecodeDestination(request.params[0].get_str());
+    if (!IsValidDestination(dest)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address");
+    }
+
+    CTxDestination refundDest = DecodeDestination(request.params[1].get_str());
+    if (!IsValidDestination(refundDest)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid refund address");
+    }
+
+    // Amount
+    CAmount nAmount = AmountFromValue(request.params[2]);
+    if (nAmount <= 0)
+        throw JSONRPCError(RPC_TYPE_ERROR, "Invalid amount for send");
+
+    // Fee
+    CAmount nFee = AmountFromValue(request.params[3]);
+    if (nFee <= 0)
+        throw JSONRPCError(RPC_TYPE_ERROR, "Invalid amount for fee");
+
+    // Mainchain fee
+    CAmount nMainchainFee = AmountFromValue(request.params[4]);
+    if (nMainchainFee <= 0)
+        throw JSONRPCError(RPC_TYPE_ERROR, "Invalid amount for mainchain fee");
+
+    EnsureWalletIsUnlocked(*pwallet);
+
+    // TODO check if script is withdrawal
+    std::vector<unsigned char> vch = ParseHex(request.params[5].get_str());
+    CScript scriptWithdrawalData = CScript(vch.begin(), vch.end());
+    if (!scriptWithdrawalData.size())
+        throw JSONRPCError(RPC_TYPE_ERROR, "Invalid withdrawal data");
+
+    std::string strFail = "";
+    uint256 txid;
+    if (!CreateWithdrawal(*pwallet, scriptWithdrawalData, nAmount, nFee, nMainchainFee, request.params[0].get_str(), request.params[1].get_str(), strFail, txid)) {
+        throw JSONRPCError(RPC_MISC_ERROR, strFail);
+    }
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("txid", txid.ToString());
+
+    return result;
+}
+    };
+}
+
 } // namespace wallet

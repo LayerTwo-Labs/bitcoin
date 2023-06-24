@@ -9,7 +9,6 @@
 #include <index/blockfilterindex.h>
 #include <interfaces/chain.h>
 #include <node/miner.h>
-#include <pow.h>
 #include <script/standard.h>
 #include <test/util/blockfilter.h>
 #include <test/util/setup_common.h>

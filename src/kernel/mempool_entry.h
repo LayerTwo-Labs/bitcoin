@@ -80,6 +80,8 @@ private:
     const int64_t nTime;            //!< Local time when entering the mempool
     const unsigned int entryHeight; //!< Chain height when entering the mempool
     const bool spendsCoinbase;      //!< keep track of transactions that spend a coinbase
+    const bool fWithdrawalRefund;   //!< Track transactions that are withdrawal refund requests
+    const uint256 wtID;             //!< The ID of a withdrawal for a withdrawalrefund
     const int64_t sigOpCost;        //!< Total sigop cost
     CAmount m_modified_fee;         //!< Used for determining the priority of the transaction for mining in a block
     LockPoints lockPoints;          //!< Track the height and time at which tx was final
@@ -100,7 +102,7 @@ private:
 public:
     CTxMemPoolEntry(const CTransactionRef& tx, CAmount fee,
                     int64_t time, unsigned int entry_height,
-                    bool spends_coinbase,
+                    bool spends_coinbase, bool fWithdrawalRefundIn, uint256 wtIDIn,
                     int64_t sigops_cost, LockPoints lp)
         : tx{tx},
           nFee{fee},
@@ -109,6 +111,8 @@ public:
           nTime{time},
           entryHeight{entry_height},
           spendsCoinbase{spends_coinbase},
+          fWithdrawalRefund{fWithdrawalRefundIn},
+          wtID{wtIDIn},
           sigOpCost{sigops_cost},
           m_modified_fee{nFee},
           lockPoints{lp},
@@ -156,6 +160,9 @@ public:
     CAmount GetModFeesWithDescendants() const { return nModFeesWithDescendants; }
 
     bool GetSpendsCoinbase() const { return spendsCoinbase; }
+
+    bool IsWithdrawalRefund() const { return fWithdrawalRefund; }
+    uint256 GetWITHDRAWALID() const { return wtID; }
 
     uint64_t GetCountWithAncestors() const { return nCountWithAncestors; }
     uint64_t GetSizeWithAncestors() const { return nSizeWithAncestors; }

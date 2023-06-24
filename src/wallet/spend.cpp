@@ -6,10 +6,12 @@
 #include <consensus/amount.h>
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
+#include <key_io.h>
 #include <numeric>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <script/signingprovider.h>
+#include <sidechain.h>
 #include <util/check.h>
 #include <util/fees.h>
 #include <util/moneystr.h>
@@ -1236,14 +1238,87 @@ bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet,
     for (const CTxIn& txin : tx_new->vin) {
         if (!coinControl.IsSelected(txin.prevout)) {
             tx.vin.push_back(txin);
-
         }
         if (lockUnspents) {
             wallet.LockCoin(txin.prevout);
         }
-
     }
 
     return true;
 }
+
+bool CreateWithdrawal(CWallet& wallet, const CScript& scriptWithdrawalData, const CAmount& nAmount, const CAmount& nFee, const CAmount& nMainchainFee, const std::string& strDestination, const std::string& strRefundDestination, std::string& strFail, uint256& txid)
+{
+    // TODO take in a change address, for now using refund address for change
+
+    if (!(nAmount > 0)) {
+        strFail = "Invalid amount - must be greater than 0.";
+        return false;
+    }
+    if (!(nFee > 0)) {
+        strFail = "Invalid fee - must be greater than 0.";
+        return false;
+    }
+    if (!(nMainchainFee > 0)) {
+        strFail = "Invalid mainchain fee - must be greater than 0.";
+        return false;
+    }
+    if (nAmount <= nFee) {
+        strFail = "Invalid amount - must be greater than fee.";
+        return false;
+    }
+    if (!scriptWithdrawalData.size()) {
+        strFail = "Missing withdrawal data script.";
+        return false;
+    }
+
+    CTxDestination dest = DecodeDestination(strDestination);
+    if (!IsValidDestination(dest)) {
+        strFail = "Invalid destination";
+        return false;
+    }
+
+    CTxDestination refundDest = DecodeDestination(strRefundDestination);
+    if (!IsValidDestination(refundDest)) {
+        strFail = "Invalid refund destination";
+        return false;
+    }
+
+    CAmount nTotal = nAmount + nFee + nMainchainFee;
+
+    std::vector<CRecipient> vSend;
+
+    // TODO merging the burn and data output into one would save space
+
+    // Withdrawal burn recipient
+    CRecipient burnRecipient = {CScript() << OP_RETURN, nAmount + nMainchainFee, false};
+    vSend.push_back(burnRecipient);
+
+    // Withdrawal data
+    CRecipient dataRecipient = {scriptWithdrawalData, 0, false};
+    vSend.push_back(dataRecipient);
+
+    // TODO use nFee and set fee amount
+
+    int nChangePos = -1;
+    CCoinControl control;
+    auto res = CreateTransaction(wallet, vSend, nChangePos, control);
+    if (!res) {
+        strFail = util::ErrorString(res).original;
+        return false;
+    }
+
+    const CTransactionRef& tx = res->tx;
+    wallet.CommitTransaction(tx, {}, {});
+    txid = tx->GetHash();
+
+    return true;
+}
+
+bool CreateWithdrawalRefundRequest(CWallet& wallet, const uint256& id, const std::vector<unsigned char>& vchSig, std::string& strFail, uint256& txid)
+{
+    // TODO
+    return false;
+}
+
 } // namespace wallet

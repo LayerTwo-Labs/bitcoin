@@ -100,12 +100,6 @@ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, c
 {
     if (chain == CBaseChainParams::MAIN) {
         return CChainParams::Main();
-    } else if (chain == CBaseChainParams::TESTNET) {
-        return CChainParams::TestNet();
-    } else if (chain == CBaseChainParams::SIGNET) {
-        auto opts = CChainParams::SigNetOptions{};
-        ReadSigNetArgs(args, opts);
-        return CChainParams::SigNet(opts);
     } else if (chain == CBaseChainParams::REGTEST) {
         auto opts = CChainParams::RegTestOptions{};
         ReadRegTestArgs(args, opts);
