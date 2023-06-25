@@ -13,6 +13,7 @@
 #include <pubkey.h>
 
 #include <optional>
+#include <functional>
 #include <vector>
 #include <stdint.h>
 
@@ -144,6 +145,10 @@ enum : uint32_t {
     // Making unknown public key versions (in BIP 342 scripts) non-standard
     SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE = (1U << 20),
 
+    // support OP_CHECKTEMPLATEVERIFY for standard template
+    //
+    SCRIPT_VERIFY_DEFAULT_CHECK_TEMPLATE_VERIFY_HASH = (1U << 21),
+
     // Validating ANYPREVOUT public keys
     SCRIPT_VERIFY_ANYPREVOUT = (1U << 22),
 
@@ -166,19 +171,31 @@ struct PrecomputedTransactionData
     uint256 m_outputs_single_hash;
     uint256 m_spent_amounts_single_hash;
     uint256 m_spent_scripts_single_hash;
-    //! Whether the 5 fields above are initialized.
-    bool m_bip341_taproot_ready = false;
+
+    // BIP119 precomputed data (single SHA256).
+    uint256 m_scriptSigs_single_hash;
 
     // BIP143 precomputed data (double-SHA256).
     uint256 hashPrevouts, hashSequence, hashOutputs;
-    //! Whether the 3 fields above are initialized.
-    bool m_bip143_segwit_ready = false;
 
     std::vector<CTxOut> m_spent_outputs;
+
+    //! Whether the bip341 fields above are initialized.
+    bool m_bip341_taproot_ready = false;
+
+    //! Whether the bip119 fields above are initialized directly (nullptr)
+    //! or lazily (using sync primitves)
+    typedef std::function<void(std::function<void()>)> bip_119_cache_synchronizer_t;
+    bip_119_cache_synchronizer_t m_bip119_cache_synchronizer;
+
+    //! Whether the bip143 fields above are initialized.
+    bool m_bip143_segwit_ready = false;
+
     //! Whether m_spent_outputs is initialized.
     bool m_spent_outputs_ready = false;
 
-    PrecomputedTransactionData() = default;
+    PrecomputedTransactionData(bip_119_cache_synchronizer_t f) : m_bip119_cache_synchronizer(f) {};
+    PrecomputedTransactionData()= default;
 
     /** Initialize this PrecomputedTransactionData with transaction data.
      *
@@ -188,11 +205,19 @@ struct PrecomputedTransactionData
      *                             regardless of what is in the inputs (used at signing
      *                             time, when the inputs aren't filled in yet). */
     template <class T>
-    void Init(const T& tx, std::vector<CTxOut>&& spent_outputs, bool force = false);
+    void Init(const T& tx, std::vector<CTxOut>&& spent_outputs, bool force = false, bip_119_cache_synchronizer_t f = nullptr);
+    template <class T>
+    void BIP119LazyInit(const T& tx);
+    template <class T>
+    void BIP119EagerInit(const T& tx);
 
     template <class T>
-    explicit PrecomputedTransactionData(const T& tx);
+    explicit PrecomputedTransactionData(const T& tx, bip_119_cache_synchronizer_t f);
 };
+
+/* Standard Template Hash Declarations */
+template<typename TxType>
+uint256 GetDefaultCheckTemplateVerifyHash(const TxType& tx, const uint256& outputs_hash, const uint256& sequences_hash, const uint32_t input_index);
 
 enum class SigVersion
 {
@@ -283,6 +308,11 @@ public:
          return false;
     }
 
+    virtual bool CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const
+    {
+        return false;
+    }
+
     virtual ~BaseSignatureChecker() {}
 };
 
@@ -306,7 +336,7 @@ private:
     const MissingDataBehavior m_mdb;
     unsigned int nIn;
     const CAmount amount;
-    const PrecomputedTransactionData* txdata;
+    PrecomputedTransactionData* txdata;
 
 protected:
     virtual bool VerifyECDSASignature(const std::vector<unsigned char>& vchSig, const CPubKey& vchPubKey, const uint256& sighash) const;
@@ -314,11 +344,12 @@ protected:
 
 public:
     GenericTransactionSignatureChecker(const T* txToIn, unsigned int nInIn, const CAmount& amountIn, MissingDataBehavior mdb) : txTo(txToIn), m_mdb(mdb), nIn(nInIn), amount(amountIn), txdata(nullptr) {}
-    GenericTransactionSignatureChecker(const T* txToIn, unsigned int nInIn, const CAmount& amountIn, const PrecomputedTransactionData& txdataIn, MissingDataBehavior mdb) : txTo(txToIn), m_mdb(mdb), nIn(nInIn), amount(amountIn), txdata(&txdataIn) {}
+    GenericTransactionSignatureChecker(const T* txToIn, unsigned int nInIn, const CAmount& amountIn, PrecomputedTransactionData& txdataIn, MissingDataBehavior mdb) : txTo(txToIn), m_mdb(mdb), nIn(nInIn), amount(amountIn), txdata(&txdataIn) {}
     bool CheckECDSASignature(const std::vector<unsigned char>& scriptSig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const override;
     bool CheckSchnorrSignature(Span<const unsigned char> sig, KeyVersion keyversion, Span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const override;
     bool CheckLockTime(const CScriptNum& nLockTime) const override;
     bool CheckSequence(const CScriptNum& nSequence) const override;
+    bool CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const override;
 };
 
 using TransactionSignatureChecker = GenericTransactionSignatureChecker<CTransaction>;

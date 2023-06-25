@@ -62,10 +62,12 @@
 #include <warnings.h>
 
 #include <algorithm>
+#include <functional>
 #include <cassert>
 #include <chrono>
 #include <deque>
 #include <numeric>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -1874,7 +1876,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
             assert(!coin.IsSpent());
             spent_outputs.emplace_back(coin.out);
         }
-        txdata.Init(tx, std::move(spent_outputs));
+        auto&& f = [flag=std::make_shared<std::once_flag>()](std::function<void()> f) mutable { std::call_once(*flag, f); };
+        txdata.Init(tx, std::move(spent_outputs), /*force=*/ false, f);
     }
     assert(txdata.m_spent_outputs.size() == tx.vin.size());
 
@@ -2182,7 +2185,7 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
     // mainnet.
     // For simplicity, always leave P2SH+WITNESS+TAPROOT on except for the two
     // violating blocks.
-    uint32_t flags{SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT | SCRIPT_VERIFY_ANYPREVOUT};
+    uint32_t flags{SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT | SCRIPT_VERIFY_ANYPREVOUT | SCRIPT_VERIFY_DEFAULT_CHECK_TEMPLATE_VERIFY_HASH};
     const auto it{consensusparams.script_flag_exceptions.find(*Assert(block_index.phashBlock))};
     if (it != consensusparams.script_flag_exceptions.end()) {
         flags = it->second;

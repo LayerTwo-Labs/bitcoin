@@ -606,7 +606,39 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     break;
                 }
 
-                case OP_NOP1: case OP_NOP4: case OP_NOP5:
+                case OP_CHECKTEMPLATEVERIFY:
+                {
+                    // if flags not enabled; treat as a NOP4
+                    if (!(flags & SCRIPT_VERIFY_DEFAULT_CHECK_TEMPLATE_VERIFY_HASH)) {
+                        if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS)
+                            return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);
+                        break;
+                    }
+
+                    if (stack.size() < 1)
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+
+                    // If the argument was not 32 bytes, treat as OP_NOP4:
+                    switch (stack.back().size()) {
+                        case 32:
+                        {
+                            const Span<const unsigned char> hash{stack.back()};
+                            if (!checker.CheckDefaultCheckTemplateVerifyHash(hash)) {
+                                return set_error(serror, SCRIPT_ERR_TEMPLATE_MISMATCH);
+                            }
+                            break;
+                        }
+                        default:
+                            // future upgrade can add semantics for this opcode with different length args
+                            // so discourage use when applicable
+                            if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS) {
+                                return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);
+                            }
+                    }
+                }
+                break;
+
+                case OP_NOP1: case OP_NOP5:
                 case OP_NOP6: case OP_NOP7: case OP_NOP8: case OP_NOP9: case OP_NOP10:
                 {
                     if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS)
@@ -1406,12 +1438,79 @@ uint256 GetSpentScriptsSHA256(const std::vector<CTxOut>& outputs_spent)
     return ss.GetSHA256();
 }
 
+/** Compute the (single) SHA256 of the concatenation of all scriptSigs in a tx. */
+template <class T>
+uint256 GetScriptSigsSHA256(const T& txTo)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    for (const auto& in : txTo.vin) {
+        ss << in.scriptSig;
+    }
+    return ss.GetSHA256();
+}
+
+/* Not Exported, just convenience */
+template<typename TxType>
+uint256 GetDefaultCheckTemplateVerifyHashWithScript(const TxType& tx, const uint256& outputs_hash, const uint256& sequences_hash,
+                                const uint256& scriptSig_hash, const uint32_t input_index) {
+    auto h = CHashWriter(SER_GETHASH, 0)
+        << tx.nVersion
+        << tx.nLockTime
+        << scriptSig_hash
+        << uint32_t(tx.vin.size())
+        << sequences_hash
+        << uint32_t(tx.vout.size())
+        << outputs_hash
+        << input_index;
+    return h.GetSHA256();
+}
+
+template<typename TxType>
+uint256 GetDefaultCheckTemplateVerifyHashEmptyScript(const TxType& tx, const uint256& outputs_hash, const uint256& sequences_hash,
+                                const uint32_t input_index) {
+    auto h = CHashWriter(SER_GETHASH, 0)
+        << tx.nVersion
+        << tx.nLockTime
+        << uint32_t(tx.vin.size())
+        << sequences_hash
+        << uint32_t(tx.vout.size())
+        << outputs_hash
+        << input_index;
+    return h.GetSHA256();
+}
 
 } // namespace
 
-template <class T>
-void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent_outputs, bool force)
+template<typename TxType>
+uint256 GetDefaultCheckTemplateVerifyHash(const TxType& tx, uint32_t input_index) {
+    return GetDefaultCheckTemplateVerifyHash(tx, GetOutputsSHA256(tx), GetSequencesSHA256(tx), input_index);
+}
+
+template<typename TxType>
+static bool NoScriptSigs(const TxType& tx)
 {
+    return std::all_of(tx.vin.begin(), tx.vin.end(), [](const CTxIn& c) { return c.scriptSig.empty(); });
+}
+
+template<typename TxType>
+uint256 GetDefaultCheckTemplateVerifyHash(const TxType& tx, const uint256& outputs_hash, const uint256& sequences_hash,
+                                const uint32_t input_index) {
+    return NoScriptSigs(tx) ? GetDefaultCheckTemplateVerifyHashEmptyScript(tx, outputs_hash, sequences_hash, input_index) :
+        GetDefaultCheckTemplateVerifyHashWithScript(tx, outputs_hash, sequences_hash, GetScriptSigsSHA256(tx), input_index);
+}
+
+template
+uint256 GetDefaultCheckTemplateVerifyHash(const CTransaction& tx, const uint256& outputs_hash, const uint256& sequences_hash,
+                                const uint32_t input_index);
+template
+uint256 GetDefaultCheckTemplateVerifyHash(const CMutableTransaction& tx, const uint256& outputs_hash, const uint256& sequences_hash,
+                                const uint32_t input_index);
+
+template <class T>
+void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent_outputs, bool force, PrecomputedTransactionData::bip_119_cache_synchronizer_t f)
+{
+    // Do not allow overriding a sync function if one is already set
+    if (m_bip119_cache_synchronizer) assert(f == nullptr);
     assert(!m_spent_outputs_ready);
 
     m_spent_outputs = std::move(spent_outputs);
@@ -1459,19 +1558,60 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
         m_spent_scripts_single_hash = GetSpentScriptsSHA256(m_spent_outputs);
         m_bip341_taproot_ready = true;
     }
+
+    if (force) {
+        // Eagerly compute BIP119 state
+        BIP119EagerInit(txTo);
+        // Disable Lazy Sync Wrapper
+        m_bip119_cache_synchronizer = nullptr;
+    } else if (!m_bip119_cache_synchronizer) {
+        // If no function was provided, assume that we are single-threaded but
+        // still cache-on-first-use
+        auto single_threaded = [&](std::function<void()> f)
+        {
+            f();
+            // disables future calls from recomputing
+            m_bip119_cache_synchronizer = nullptr;
+        };
+        m_bip119_cache_synchronizer = single_threaded;
+    }
 }
 
 template <class T>
-PrecomputedTransactionData::PrecomputedTransactionData(const T& txTo)
+void PrecomputedTransactionData::BIP119EagerInit(const T& txTo)
+{
+    if (!(m_bip143_segwit_ready || m_bip341_taproot_ready)) {
+        m_prevouts_single_hash = GetPrevoutsSHA256(txTo);
+        m_sequences_single_hash = GetSequencesSHA256(txTo);
+        m_outputs_single_hash = GetOutputsSHA256(txTo);
+    }
+    // 0 hash used to signal if we should skip scriptSigs
+    // when re-computing for different indexes.
+    m_scriptSigs_single_hash = NoScriptSigs(txTo) ? uint256{} : GetScriptSigsSHA256(txTo);
+}
+template <class T>
+void PrecomputedTransactionData::BIP119LazyInit(const T& txTo)
+{
+    if (m_bip119_cache_synchronizer) {
+        m_bip119_cache_synchronizer([&]() {
+            BIP119EagerInit(txTo);
+        });
+    }
+}
+
+template <class T>
+PrecomputedTransactionData::PrecomputedTransactionData(const T& txTo, PrecomputedTransactionData::bip_119_cache_synchronizer_t f) : m_bip119_cache_synchronizer(f)
 {
     Init(txTo, {});
 }
 
 // explicit instantiation
-template void PrecomputedTransactionData::Init(const CTransaction& txTo, std::vector<CTxOut>&& spent_outputs, bool force);
-template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo, std::vector<CTxOut>&& spent_outputs, bool force);
-template PrecomputedTransactionData::PrecomputedTransactionData(const CTransaction& txTo);
-template PrecomputedTransactionData::PrecomputedTransactionData(const CMutableTransaction& txTo);
+template void PrecomputedTransactionData::Init(const CTransaction& txTo, std::vector<CTxOut>&& spent_outputs, bool force, PrecomputedTransactionData::bip_119_cache_synchronizer_t f);
+template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo, std::vector<CTxOut>&& spent_outputs, bool force, PrecomputedTransactionData::bip_119_cache_synchronizer_t f);
+template void PrecomputedTransactionData::BIP119LazyInit(const CTransaction& txTo);
+template void PrecomputedTransactionData::BIP119LazyInit(const CMutableTransaction& txTo);
+template PrecomputedTransactionData::PrecomputedTransactionData(const CTransaction& txTo, PrecomputedTransactionData::bip_119_cache_synchronizer_t f);
+template PrecomputedTransactionData::PrecomputedTransactionData(const CMutableTransaction& txTo, PrecomputedTransactionData::bip_119_cache_synchronizer_t f);
 
 const HashWriter HASHER_TAPSIGHASH{TaggedHash("TapSighash")};
 const HashWriter HASHER_TAPLEAF{TaggedHash("TapLeaf")};
@@ -1813,6 +1953,23 @@ bool GenericTransactionSignatureChecker<T>::CheckSequence(const CScriptNum& nSeq
         return false;
 
     return true;
+}
+
+template <class T>
+bool GenericTransactionSignatureChecker<T>::CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const
+{
+    // Should already be checked before calling...
+    assert(hash.size() == 32);
+    if (txdata && txTo) {
+        txdata->BIP119LazyInit(*txTo);
+        uint256 hash_tmpl = txdata->m_scriptSigs_single_hash.IsNull() ?
+            GetDefaultCheckTemplateVerifyHashEmptyScript(*txTo, txdata->m_outputs_single_hash, txdata->m_sequences_single_hash, nIn) :
+            GetDefaultCheckTemplateVerifyHashWithScript(*txTo, txdata->m_outputs_single_hash, txdata->m_sequences_single_hash,
+                    txdata->m_scriptSigs_single_hash, nIn);
+        return std::equal(hash_tmpl.begin(), hash_tmpl.end(), hash.data());
+    } else {
+        return HandleMissingData(m_mdb);
+    }
 }
 
 // explicit instantiation
