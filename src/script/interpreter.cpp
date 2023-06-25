@@ -9,10 +9,11 @@
 #include <crypto/sha1.h>
 #include <crypto/sha256.h>
 #include <pubkey.h>
+#include <span.h>
 #include <script/script.h>
 #include <uint256.h>
-
-typedef std::vector<unsigned char> valtype;
+#include <util/rbf.h>
+#include <util/vector.h>
 
 namespace {
 
@@ -418,6 +419,12 @@ static bool EvalChecksig(const valtype& sig, const valtype& pubkey, CScript::con
     assert(false);
 }
 
+const HashWriter HASHER_VAULT_RECOVERY_SPK{TaggedHash("VaultRecoverySPK")};
+
+static uint256 VaultScriptHash(const HashWriter hw, const CScript& script) {
+    return (HashWriter{hw} << script).GetSHA256();
+}
+
 bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror)
 {
     static const CScriptNum bnZero(0);
@@ -448,6 +455,11 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
     execdata.m_codeseparator_pos = 0xFFFFFFFFUL;
     execdata.m_codeseparator_pos_init = true;
 
+    // Get an output index off the stack - returns false if error.
+    const auto GetVoutIdxFromStack = [&](const size_t stack_idx) -> auto {
+        auto out = CScriptNum(stacktop(stack_idx), fRequireMinimal).GetInt64();
+        return out < 0 ? std::nullopt : std::make_optional(static_cast<size_t>(out));
+    };
     try
     {
         for (; pc < pend; ++opcode_pos) {
@@ -1260,6 +1272,116 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                 }
                 break;
 
+                case OP_VAULT_RECOVER:
+                {
+                    // Only available in Tapscript
+                    if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) {
+                        return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+                    }
+
+                    // Stack:
+                    //  - <recovery-sPK-hash>
+                    //  - <recovery-vout-idx>
+                    if (stack.size() < 2) {
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+                    }
+
+                    const valtype& hash_bytes_from_stack = stacktop(-1);
+                    if (hash_bytes_from_stack.size() != 32) {
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+                    }
+                    const uint256 recovery_spk_hash{hash_bytes_from_stack};
+
+                    std::optional<size_t> recovery_vout_idx = GetVoutIdxFromStack(-2);
+                    if (!recovery_vout_idx) {
+                        return set_error(serror, SCRIPT_ERR_VAULT_BAD_VOUT_IDX);
+                    }
+
+                    if (const auto& err = checker.CheckVaultRecover(
+                            *recovery_vout_idx, execdata, recovery_spk_hash, script, flags)) {
+                        return set_error(serror, *err);
+                    }
+
+                    popstack(stack);
+                    popstack(stack);
+                    stack.push_back(vchTrue);
+                }
+                break;
+
+                case OP_VAULT:
+                {
+                    // Only available in Tapscript
+                    if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) {
+                        return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+                    }
+
+                    // Stack:
+                    //  - <flu-script>
+                    //  - <n-pushes>
+                    //  [ n items ... ]
+                    //  - <trigger-vout-idx>
+                    //  - <revault-vout-idx>
+                    //  - <revault-amount>
+                    if (stack.size() < 5) {
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+                    }
+
+                    const valtype& flu_script_data{stacktop(-1)};
+                    CScript flu_script_body{flu_script_data.begin(), flu_script_data.end()};
+                    popstack(stack);
+
+                    const CScriptNum n_pushes_data{stacktop(-1), fRequireMinimal};
+                    const size_t n_pushes = static_cast<size_t>(n_pushes_data.GetInt64());
+                    popstack(stack);
+
+                    // Needed on stack: n pushes + the 2 vout indices
+                    if (stack.size() < (n_pushes + 2)) {
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+                    }
+
+                    // Extract the `n` data pushes and construct the entire expected
+                    // FORWARD_LEAF_UPDATE script.
+                    std::vector<valtype> flu_data{
+                        std::make_move_iterator(stack.end() - n_pushes),
+                        std::make_move_iterator(stack.end())};
+                    stack.erase(stack.end() - n_pushes, stack.end());
+
+                    CScript flu_script = PushAll(flu_data);
+                    flu_script.reserve(flu_script.size() + flu_script_body.size());
+                    move_to_end(flu_script, flu_script_body);
+
+                    // Indicates which of the vouts carries forward
+                    // the value from the vault into the unvault trigger output.
+                    std::optional<size_t> trigger_vout_idx = GetVoutIdxFromStack(-1);
+                    if (!trigger_vout_idx) {
+                        return set_error(serror, SCRIPT_ERR_VAULT_BAD_VOUT_IDX);
+                    }
+
+                    // Indicates which (if any) of the vouts is a "revault" of some
+                    // portion of the value back into the original vault sPK.
+                    std::optional<size_t> revault_vout_idx = GetVoutIdxFromStack(-2);
+
+                    auto revault_amount = CScriptNum(
+                        // nMaxNumSize of 7, since that's the maximum number of bytes
+                        // necessary to capture any valid satoshi values (21e6 * 100e6).
+                        stacktop(-3), fRequireMinimal, /*nMaxNumSize=*/7).GetInt64();
+                    if (revault_amount < 0) {
+                        return set_error(serror, SCRIPT_ERR_VAULT_BAD_REVAULT);
+                    }
+
+                    if (const auto& err = checker.CheckVaultTrigger(
+                            execdata, *trigger_vout_idx, revault_vout_idx, revault_amount,
+                            flu_script, flags, serror)) {
+                        return set_error(serror, *err);
+                    }
+
+                    popstack(stack);
+                    popstack(stack);
+                    popstack(stack);
+                    stack.push_back(vchTrue);
+                }
+                break;
+
                 default:
                     return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
             }
@@ -1280,9 +1402,10 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
     return set_success(serror);
 }
 
-bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror)
+bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, std::vector<DeferredCheck>* deferred_checks)
 {
     ScriptExecutionData execdata;
+    execdata.m_deferred_checks = deferred_checks;
     return EvalScript(stack, script, flags, checker, sigversion, execdata, serror);
 }
 
@@ -1972,6 +2095,193 @@ bool GenericTransactionSignatureChecker<T>::CheckDefaultCheckTemplateVerifyHash(
     }
 }
 
+//! Return true if the given output is a 0-value anchor output.
+//!
+//! Note, this is stolen from https://github.com/bitcoin/bitcoin/pull/26403, and so
+//! should be updated to use whatever lands there.
+static bool IsOutputEphemeralAnchor(const CTxOut& out)
+{
+    if (out.nValue != 0) {
+        return false;
+    }
+    const CScript& spk = out.scriptPubKey;
+    if (!(spk.size() == 1 && spk[0] == OP_2)) {
+        return false;
+    }
+    return true;
+}
+
+template <class T>
+std::optional<ScriptError> GenericTransactionSignatureChecker<T>::CheckVaultRecover(
+    const size_t recovery_vout_idx,
+    ScriptExecutionData& execdata,
+    const uint256& expected_recovery_spk_hash,
+    const CScript& executing_script,
+    unsigned int flags) const
+{
+    const auto& vout = this->txTo->vout;
+    const auto num_vout = vout.size();
+
+    assert(recovery_vout_idx >= 0);
+    if (num_vout <= recovery_vout_idx) {
+        return SCRIPT_ERR_VAULT_BAD_VOUT_IDX;
+    }
+    const CTxOut& recovery_out{vout[recovery_vout_idx]};
+    const uint256 output_spk_hash = VaultScriptHash(
+        HASHER_VAULT_RECOVERY_SPK, recovery_out.scriptPubKey);
+
+    if (output_spk_hash != expected_recovery_spk_hash) {
+        return SCRIPT_ERR_VAULT_BAD_RECOVERY_OUTPUTS;
+
+    }
+
+    if (recovery_out.nValue < this->amount) {
+        // Recovery out value doesn't cover _at least_ the amount of this input.
+        //
+        // Note that because there may be multiple vaulted inputs paying to the same
+        // recovery output, we must use a deferred check to ensure the sum value of
+        // all compatible vaults is paid out.
+        return SCRIPT_ERR_VAULT_LOW_RECOVERY_AMOUNT;
+    }
+
+    const CTxIn& this_in{this->txTo->vin[this->nIn]};
+
+    // Ensure that the recovery transaction is replaceable (by policy).
+    if (flags & SCRIPT_VERIFY_VAULT_REPLACEABLE_RECOVERY &&
+            this_in.nSequence > MAX_BIP125_RBF_SEQUENCE) {
+        // TODO: when transaction nVersion=3 policy is merged, this should be updated
+        // since the goal here is to ensure that recovery transactions are replaceable.
+        return SCRIPT_ERR_VAULT_RECOVERY_NOT_REPLACEABLE;
+    }
+
+    // If there are additional bytes beyond "<recovery-path-sPK-hash> OP_VAULT_RECOVER",
+    // then this is considered an authorized recovery.
+    //
+    // FIXME document the comparison more.
+    const bool is_authed_recovery{executing_script.size() > (uint256::WIDTH + 2)};
+
+    // If this is an unauthenticated recovery, ensure that the only other
+    // output is an ephemeral anchor (by policy).
+    if (flags & SCRIPT_VERIFY_VAULT_UNAUTH_RECOVERY_STRUCTURE && !is_authed_recovery) {
+        const size_t optional_ea_idx{recovery_vout_idx == 0 ? 1U : 0U};
+        if (num_vout != 2 || !IsOutputEphemeralAnchor(vout[optional_ea_idx])) {
+            return SCRIPT_ERR_VAULT_BAD_RECOVERY_OUTPUTS;
+        }
+    }
+
+    execdata.AddDeferredVaultRecoveryCheck(recovery_vout_idx, this->amount);
+
+    return std::nullopt;
+}
+
+template <class T>
+std::optional<ScriptError> GenericTransactionSignatureChecker<T>::CheckVaultTrigger(
+    ScriptExecutionData& execdata,
+    const size_t trigger_out_idx,
+    const std::optional<size_t> maybe_revault_out_idx,
+    const CAmount revault_amount,
+    CScript flu_script,
+    unsigned int flags,
+    ScriptError* serror) const
+{
+    assert(execdata.m_curr_witversion);
+
+    if (!this->txdata) {
+        HandleMissingData(m_mdb);
+        return SCRIPT_ERR_UNKNOWN_ERROR;
+    }
+    const auto& txd{*this->txdata};
+    const auto& vout{this->txTo->vout};
+
+    assert(txd.m_spent_outputs_ready);
+    const CScript& vault_spk = txd.m_spent_outputs[this->nIn].scriptPubKey;
+
+    if (trigger_out_idx >= vout.size()) {
+        return SCRIPT_ERR_UNVAULT_MISMATCH;
+    }
+
+    // Ensure that the output creating the unvault trigger matches the
+    // expected scriptPubKey.
+    const auto& value_out = vout[trigger_out_idx];
+
+    int trigger_witversion;
+    valtype trigger_witprogram;
+    const bool is_unvault_output_wit =
+        value_out.scriptPubKey.IsWitnessProgram(trigger_witversion, trigger_witprogram);
+
+    if (!is_unvault_output_wit || trigger_witversion < 1 ||
+            trigger_witversion != *execdata.m_curr_witversion) {
+        return SCRIPT_ERR_UNVAULT_INCOMPAT_OUTPUT_TYPE;
+    }
+    else if (trigger_witversion == 1) {
+        assert(execdata.m_internal_key);
+        assert(execdata.m_taproot_control.size() > 0);
+
+        const valtype& control = execdata.m_taproot_control;
+        const valtype val_sPK{
+            value_out.scriptPubKey.begin(), value_out.scriptPubKey.end()};
+
+        if (val_sPK.size() != 34) {
+            return SCRIPT_ERR_UNVAULT_MISMATCH;
+        }
+        const XOnlyPubKey val_pk{Span{val_sPK}.subspan(2)};
+
+        auto tapleaf_hash = ComputeTapleafHash(
+            control[0] & TAPROOT_LEAF_MASK, flu_script);
+        const uint256 merkle_root = ComputeTaprootMerkleRoot(control, tapleaf_hash);
+        const auto expected_pk = (*execdata.m_internal_key).CreateTapTweak(&merkle_root);
+
+        // Ensure the currently executing OP_VAULT tapleaf is substituted for the
+        // expected replacement.
+        if (!(expected_pk && val_pk == expected_pk->first)) {
+            return SCRIPT_ERR_UNVAULT_MISMATCH;
+        }
+    }
+    // Append the handling of future witness versions with `else if`s here.
+    else {
+        if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) {
+            return SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM;
+        }
+        set_success(serror);
+        return std::nullopt;
+    }
+
+    CAmount total_val_out_to_vaults = value_out.nValue;
+
+    if (maybe_revault_out_idx) {
+        if (*maybe_revault_out_idx >= vout.size()) {
+            return SCRIPT_ERR_VAULT_BAD_REVAULT;
+        }
+        // Belt-and-suspenders amount checks.
+        if (revault_amount <= 0 || revault_amount > this->amount) {
+            return SCRIPT_ERR_VAULT_BAD_REVAULT;
+        }
+
+        const auto& revault_out = vout[*maybe_revault_out_idx];
+
+        if (revault_out.scriptPubKey != vault_spk) {
+            return SCRIPT_ERR_VAULT_BAD_REVAULT;
+        }
+        total_val_out_to_vaults += revault_out.nValue;
+    } else {
+        // If no revault index given, revault amount should be zero.
+        if (revault_amount != 0) {
+            return SCRIPT_ERR_VAULT_BAD_REVAULT;
+        }
+    }
+
+    if (total_val_out_to_vaults < this->amount) {
+        // Necessary but not sufficient check - other compatible inputs have to be
+        // accounted for.
+        return SCRIPT_ERR_UNVAULT_MISMATCH;
+    }
+
+    execdata.AddDeferredVaultTriggerCheck(
+        trigger_out_idx, maybe_revault_out_idx, revault_amount, this->amount);
+    return std::nullopt;
+}
+
+
 // explicit instantiation
 template class GenericTransactionSignatureChecker<CTransaction>;
 template class GenericTransactionSignatureChecker<CMutableTransaction>;
@@ -1979,6 +2289,8 @@ template class GenericTransactionSignatureChecker<CMutableTransaction>;
 static bool ExecuteWitnessScript(const Span<const valtype>& stack_span, const CScript& exec_script, unsigned int flags, SigVersion sigversion, const BaseSignatureChecker& checker, ScriptExecutionData& execdata, ScriptError* serror)
 {
     std::vector<valtype> stack{stack_span.begin(), stack_span.end()};
+
+    const bool is_vault_active = (flags & SCRIPT_VERIFY_VAULT);
 
     if (sigversion == SigVersion::TAPSCRIPT) {
         // OP_SUCCESSx processing overrides everything, including stack element size limits
@@ -1990,7 +2302,9 @@ static bool ExecuteWitnessScript(const Span<const valtype>& stack_span, const CS
                 return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
             }
             // New opcodes will be listed here. May use a different sigversion to modify existing opcodes.
-            if (IsOpSuccess(opcode)) {
+            if (is_vault_active && (opcode == OP_VAULT || opcode == OP_VAULT_RECOVER)) {
+                continue;
+            } else if (IsOpSuccess(opcode)) {
                 if (flags & SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS) {
                     return set_error(serror, SCRIPT_ERR_DISCOURAGE_OP_SUCCESS);
                 }
@@ -2062,11 +2376,13 @@ static bool VerifyTaprootCommitment(const std::vector<unsigned char>& control, c
     return q.CheckTapTweak(p, merkle_root, control[0] & 1);
 }
 
-static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, const std::vector<unsigned char>& program, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror, bool is_p2sh)
+static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, const std::vector<unsigned char>& program, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror, bool is_p2sh, std::vector<DeferredCheck>* deferred_checks = nullptr)
 {
     CScript exec_script; //!< Actually executed script (last stack item in P2WSH; implied P2PKH script in P2WPKH; leaf script in P2TR)
     Span stack{witness.stack};
     ScriptExecutionData execdata;
+    execdata.m_deferred_checks = deferred_checks;
+    execdata.m_curr_witversion = std::make_optional(witversion);
 
     if (witversion == 0) {
         if (program.size() == WITNESS_V0_SCRIPTHASH_SIZE) {
@@ -2119,6 +2435,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
                 return set_error(serror, SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE);
             }
             execdata.m_tapleaf_hash = ComputeTapleafHash(control[0] & TAPROOT_LEAF_MASK, script);
+            execdata.m_taproot_control = control;
             if (!VerifyTaprootCommitment(control, program, execdata.m_tapleaf_hash, execdata.m_internal_key)) {
                 return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH);
             }
@@ -2145,7 +2462,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
     // There is intentionally no return statement here, to be able to use "control reaches end of non-void function" warnings to detect gaps in the logic above.
 }
 
-bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror)
+bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror, std::vector<DeferredCheck>* deferred_checks)
 {
     static const CScriptWitness emptyWitness;
     if (witness == nullptr) {
@@ -2185,7 +2502,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
                 // The scriptSig must be _exactly_ CScript(), otherwise we reintroduce malleability.
                 return set_error(serror, SCRIPT_ERR_WITNESS_MALLEATED);
             }
-            if (!VerifyWitnessProgram(*witness, witnessversion, witnessprogram, flags, checker, serror, /*is_p2sh=*/false)) {
+            if (!VerifyWitnessProgram(*witness, witnessversion, witnessprogram, flags, checker, serror, /*is_p2sh=*/false, deferred_checks)) {
                 return false;
             }
             // Bypass the cleanstack check at the end. The actual stack is obviously not clean
@@ -2230,7 +2547,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
                     // reintroduce malleability.
                     return set_error(serror, SCRIPT_ERR_WITNESS_MALLEATED_P2SH);
                 }
-                if (!VerifyWitnessProgram(*witness, witnessversion, witnessprogram, flags, checker, serror, /*is_p2sh=*/true)) {
+                if (!VerifyWitnessProgram(*witness, witnessversion, witnessprogram, flags, checker, serror, /*is_p2sh=*/true, deferred_checks)) {
                     return false;
                 }
                 // Bypass the cleanstack check at the end. The actual stack is obviously not clean

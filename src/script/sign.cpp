@@ -365,23 +365,6 @@ static bool SignStep(const SigningProvider& provider, const BaseSignatureCreator
     assert(false);
 }
 
-static CScript PushAll(const std::vector<valtype>& values)
-{
-    CScript result;
-    for (const valtype& v : values) {
-        if (v.size() == 0) {
-            result << OP_0;
-        } else if (v.size() == 1 && v[0] >= 1 && v[0] <= 16) {
-            result << CScript::EncodeOP_N(v[0]);
-        } else if (v.size() == 1 && v[0] == 0x81) {
-            result << OP_1NEGATE;
-        } else {
-            result << v;
-        }
-    }
-    return result;
-}
-
 template<typename M, typename K, typename V>
 miniscript::Availability MsLookupHelper(const M& map, const K& key, V& value)
 {

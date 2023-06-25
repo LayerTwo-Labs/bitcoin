@@ -1798,7 +1798,17 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
 bool CScriptCheck::operator()() {
     const CScript &scriptSig = ptxTo->vin[nIn].scriptSig;
     const CScriptWitness *witness = &ptxTo->vin[nIn].scriptWitness;
-    return VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, CachingTransactionSignatureChecker(ptxTo, nIn, m_tx_out.nValue, cacheStore, *txdata), &error);
+
+    const bool ok = VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, CachingTransactionSignatureChecker(ptxTo, nIn, m_tx_out.nValue, cacheStore, *txdata), &error, &m_deferred_checks);
+
+    for (auto& check : m_deferred_checks) {
+        // Attach the related transaction on the deferred check because otherwise
+        // we can't associate the two after a block's worth of script checks
+        // have been batched together.
+        check.m_tx_to = ptxTo;
+    }
+
+    return ok;
 }
 
 static CuckooCache::cache<uint256, SignatureCacheHasher> g_scriptExecutionCache;
@@ -1821,6 +1831,64 @@ bool InitScriptExecutionCache(size_t max_size_bytes)
     LogPrintf("Using %zu MiB out of %zu MiB requested for script execution cache, able to store %zu elements\n",
               approx_size_bytes >> 20, max_size_bytes >> 20, num_elems);
     return true;
+}
+
+struct DeferredCheckError
+{
+    std::string m_code;
+    std::string ToString() { return m_code; }
+};
+
+using UnvaultTriggerIdx = std::pair<unsigned int, std::optional<unsigned int>>;
+struct SimpleHash {
+    size_t operator()(const UnvaultTriggerIdx& p) const { return p.first ^ p.second.value_or(-1); }
+};
+
+//! Process all deferred script checks and perform the related validation against
+//! the transaction that generated them.
+static std::optional<DeferredCheckError> ValidateDeferredChecks(
+    const std::vector<DeferredCheck>& checks,
+    const CTransaction& tx)
+{
+    std::unordered_map<size_t, CAmount> expected_trigger_out;
+    std::unordered_map<size_t, CAmount> expected_recovery_out;
+
+    for (const auto& c : checks) {
+        if (const auto& recov_check = c.m_recov_spend_check) {
+            expected_recovery_out[recov_check->vout_idx] += recov_check->amount;
+        }
+        else if (const auto& trigger_check = c.m_vault_trigger_check) {
+            if (!trigger_check->revault_vout_idx) {
+                expected_trigger_out[trigger_check->vout_idx] += trigger_check->amount;
+            } else {
+                auto revault_amt{trigger_check->revault_amount};
+                auto trigger_amt{trigger_check->amount - revault_amt};
+                Assume(trigger_amt >= 0);
+
+                expected_trigger_out[trigger_check->vout_idx] += trigger_amt;
+                expected_trigger_out[*trigger_check->revault_vout_idx] += revault_amt;
+            }
+        }
+    }
+
+    // Ensure that all vault inputs being swept to recovery have their value reflected
+    // in the corresponding outputs.
+    for (const auto& [vout_idx, amount] : expected_recovery_out) {
+        if (tx.vout[vout_idx].nValue != amount) {
+            return DeferredCheckError{"vault-insufficient-recovery-value"};
+        }
+    }
+
+    // Ensure that all vault inputs being triggered for unvault have their value
+    // reflected in the corresponding outputs.
+    for (const auto& [vout_idx, amount] : expected_trigger_out) {
+        if (tx.vout[vout_idx].nValue != amount) {
+            return DeferredCheckError{"vault-insufficient-trigger-value"};
+        }
+    }
+
+    // Perform more deferred checks here.
+    return std::nullopt;
 }
 
 /**
@@ -1881,6 +1949,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     }
     assert(txdata.m_spent_outputs.size() == tx.vin.size());
 
+    std::vector<DeferredCheck> deferred_checks;
+
     for (unsigned int i = 0; i < tx.vin.size(); i++) {
 
         // We very carefully only pass in things to CScriptCheck which
@@ -1893,31 +1963,49 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         CScriptCheck check(txdata.m_spent_outputs[i], tx, i, flags, cacheSigStore, &txdata);
         if (pvChecks) {
             pvChecks->emplace_back(std::move(check));
-        } else if (!check()) {
-            if (flags & STANDARD_NOT_MANDATORY_VERIFY_FLAGS) {
-                // Check whether the failure was caused by a
-                // non-mandatory script verification check, such as
-                // non-standard DER encodings or non-null dummy
-                // arguments; if so, ensure we return NOT_STANDARD
-                // instead of CONSENSUS to avoid downstream users
-                // splitting the network between upgraded and
-                // non-upgraded nodes by banning CONSENSUS-failing
-                // data providers.
-                CScriptCheck check2(txdata.m_spent_outputs[i], tx, i,
-                        flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS, cacheSigStore, &txdata);
-                if (check2())
-                    return state.Invalid(TxValidationResult::TX_NOT_STANDARD, strprintf("non-mandatory-script-verify-flag (%s)", ScriptErrorString(check.GetScriptError())));
+        } else {
+            if (check()) {
+                move_to_end(deferred_checks, check.m_deferred_checks);
+            } else {
+                if (flags & STANDARD_NOT_MANDATORY_VERIFY_FLAGS) {
+                    // Check whether the failure was caused by a
+                    // non-mandatory script verification check, such as
+                    // non-standard DER encodings or non-null dummy
+                    // arguments; if so, ensure we return NOT_STANDARD
+                    // instead of CONSENSUS to avoid downstream users
+                    // splitting the network between upgraded and
+                    // non-upgraded nodes by banning CONSENSUS-failing
+                    // data providers.
+                    CScriptCheck check2(txdata.m_spent_outputs[i], tx, i,
+                            flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS, cacheSigStore, &txdata);
+                    if (check2())
+                        return state.Invalid(TxValidationResult::TX_NOT_STANDARD, strprintf("non-mandatory-script-verify-flag (%s)", ScriptErrorString(check.GetScriptError())));
+                }
+                // MANDATORY flag failures correspond to
+                // TxValidationResult::TX_CONSENSUS. Because CONSENSUS
+                // failures are the most serious case of validation
+                // failures, we may need to consider using
+                // RECENT_CONSENSUS_CHANGE for any script failure that
+                // could be due to non-upgraded nodes which we may want to
+                // support, to avoid splitting the network (but this
+                // depends on the details of how net_processing handles
+                // such errors).
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, strprintf("mandatory-script-verify-flag-failed (%s)", ScriptErrorString(check.GetScriptError())));
             }
-            // MANDATORY flag failures correspond to
-            // TxValidationResult::TX_CONSENSUS. Because CONSENSUS
-            // failures are the most serious case of validation
-            // failures, we may need to consider using
-            // RECENT_CONSENSUS_CHANGE for any script failure that
-            // could be due to non-upgraded nodes which we may want to
-            // support, to avoid splitting the network (but this
-            // depends on the details of how net_processing handles
-            // such errors).
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, strprintf("mandatory-script-verify-flag-failed (%s)", ScriptErrorString(check.GetScriptError())));
+        }
+    }
+
+    // If we aren't verifying input scripts asynchronously, perform the aggregate
+    // deferred checks here.
+    //
+    // NOTE: when `pvChecks` is in use, the deferred checks MUST be performed after
+    // the results of the script checks are gathered. At time of writing, this happens
+    // in ConnectBlock().
+    if (!pvChecks && !deferred_checks.empty()) {
+        if (auto error = ValidateDeferredChecks(deferred_checks, tx)) {
+            return state.Invalid(
+                TxValidationResult::TX_CONSENSUS,
+                strprintf("script-verify-deferred-checks-failed (%s)", error->ToString()));
         }
     }
 
@@ -2133,7 +2221,7 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
     return fClean ? DISCONNECT_OK : DISCONNECT_UNCLEAN;
 }
 
-static CCheckQueue<CScriptCheck> scriptcheckqueue(128);
+static CCheckQueue<CScriptCheck, DeferredCheck> scriptcheckqueue(128);
 
 void StartScriptCheckWorkerThreads(int threads_num)
 {
@@ -2185,7 +2273,7 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
     // mainnet.
     // For simplicity, always leave P2SH+WITNESS+TAPROOT on except for the two
     // violating blocks.
-    uint32_t flags{SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT | SCRIPT_VERIFY_ANYPREVOUT | SCRIPT_VERIFY_DEFAULT_CHECK_TEMPLATE_VERIFY_HASH};
+    uint32_t flags{SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT | SCRIPT_VERIFY_ANYPREVOUT | SCRIPT_VERIFY_DEFAULT_CHECK_TEMPLATE_VERIFY_HASH | SCRIPT_VERIFY_VAULT};
     const auto it{consensusparams.script_flag_exceptions.find(*Assert(block_index.phashBlock))};
     if (it != consensusparams.script_flag_exceptions.end()) {
         flags = it->second;
@@ -2423,7 +2511,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // in multiple threads). Preallocate the vector size so a new allocation
     // doesn't invalidate pointers into the vector, and keep txsdata in scope
     // for as long as `control`.
-    CCheckQueueControl<CScriptCheck> control(fScriptChecks && parallel_script_checks ? &scriptcheckqueue : nullptr);
+    CCheckQueueControl<CScriptCheck, DeferredCheck> control(fScriptChecks && parallel_script_checks ? &scriptcheckqueue : nullptr);
+
     std::vector<PrecomputedTransactionData> txsdata(block.vtx.size());
 
     std::vector<int> prevheights;
@@ -2924,10 +3013,33 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         }
     }
 
-    if (!control.Wait()) {
+    auto [script_checks_okay, deferred_checks] = control.Wait();
+    if (!script_checks_okay) {
         LogPrintf("ERROR: %s: CheckQueue failed\n", __func__);
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "block-validation-failed");
     }
+
+    assert(deferred_checks.has_value());
+    std::unordered_map<const CTransaction*, std::vector<DeferredCheck>> tx_to_checks;
+    for (auto& check : *deferred_checks) {
+        assert(check.m_tx_to);
+        tx_to_checks[check.m_tx_to].push_back(std::move(check));
+    }
+
+    for (const auto &[tx, checks] : tx_to_checks) {
+        std::optional<DeferredCheckError> error{std::nullopt};
+        try {
+            error = ValidateDeferredChecks(checks, *tx);
+        } catch (const std::exception& e) {
+            LogPrintf("Encountered exception processing deferred check: %s\n", e.what());
+            error = DeferredCheckError{"unknown"};
+        }
+
+        if (error) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "block-validation-failed");
+        }
+    }
+
     const auto time_4{SteadyClock::now()};
     time_verify += time_4 - time_2;
     LogPrint(BCLog::BENCH, "    - Verify %u txins: %.2fms (%.3fms/txin) [%.2fs (%.2fms/blk)]\n", nInputs - 1,

@@ -264,6 +264,7 @@ BITCOIN_CORE_H = \
   support/cleanse.h \
   support/events.h \
   support/lockedpool.h \
+  span.h \
   sync.h \
   threadsafety.h \
   timedata.h \
@@ -636,6 +637,8 @@ libbitcoin_consensus_a_SOURCES = \
   tinyformat.h \
   uint256.cpp \
   uint256.h \
+  util/check.cpp \
+  util/check.h \
   util/strencodings.cpp \
   util/strencodings.h \
   version.h
