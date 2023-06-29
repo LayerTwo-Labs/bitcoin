@@ -1965,7 +1965,7 @@ static std::optional<DeferredCheckError> ValidateDeferredChecks(
     // Ensure that all vault inputs being swept to recovery have their value reflected
     // in the corresponding outputs.
     for (const auto& [vout_idx, amount] : expected_recovery_out) {
-        if (tx.vout[vout_idx].nValue != amount) {
+        if (tx.vout[vout_idx].nValue < amount) {
             return DeferredCheckError{"vault-insufficient-recovery-value"};
         }
     }
@@ -1973,7 +1973,7 @@ static std::optional<DeferredCheckError> ValidateDeferredChecks(
     // Ensure that all vault inputs being triggered for unvault have their value
     // reflected in the corresponding outputs.
     for (const auto& [vout_idx, amount] : expected_trigger_out) {
-        if (tx.vout[vout_idx].nValue != amount) {
+        if (tx.vout[vout_idx].nValue < amount) {
             return DeferredCheckError{"vault-insufficient-trigger-value"};
         }
     }
