@@ -19,6 +19,7 @@ constexpr size_t REDOWNLOAD_BUFFER_SIZE{13959}; // 13959/584 = ~23.9 commitments
 
 // Our memory analysis assumes 48 bytes for a CompressedHeader (so we should
 // re-calculate parameters if we compress further)
+
 static_assert(sizeof(CompressedHeader) == 104);
 
 HeadersSyncState::HeadersSyncState(NodeId id, const Consensus::Params& consensus_params,
@@ -39,7 +40,7 @@ HeadersSyncState::HeadersSyncState(NodeId id, const Consensus::Params& consensus
     // could try again, if necessary, to sync a longer chain).
     m_max_commitments = 6*(Ticks<std::chrono::seconds>(GetAdjustedTime() - NodeSeconds{std::chrono::seconds{chain_start->GetMedianTimePast()}}) + MAX_FUTURE_BLOCK_TIME) / HEADER_COMMITMENT_PERIOD;
 
-    LogPrint(BCLog::NET, "Initial headers sync started with peer=%d: height=%i", m_id, m_current_height);
+    LogPrint(BCLog::NET, "Initial headers sync started with peer=%d: height=%i max_commitments=%i", m_id, m_current_height, m_max_commitments);
 }
 
 /** Free any memory in use, and mark this object as no longer usable. This is
@@ -159,6 +160,14 @@ bool HeadersSyncState::ValidateAndStoreHeadersCommitments(const std::vector<CBlo
         }
     }
 
+    m_redownloaded_headers.clear();
+    m_redownload_buffer_last_height = m_chain_start->nHeight;
+    m_redownload_buffer_first_prev_hash = m_chain_start->GetBlockHash();
+    m_redownload_buffer_last_hash = m_chain_start->GetBlockHash();
+    m_download_state = State::REDOWNLOAD;
+
+    LogPrint(BCLog::NET, "Initial headers sync transition with peer=%d: reached sufficient work at height=%i, redownloading from height=%i\n", m_id, m_current_height, m_redownload_buffer_last_height);
+
     return true;
 }
 
@@ -194,6 +203,15 @@ bool HeadersSyncState::ValidateAndStoreRedownloadedHeader(const CBlockHeader& he
     if (m_download_state != State::REDOWNLOAD) return false;
 
     int64_t next_height = m_redownload_buffer_last_height + 1;
+
+    // Ensure that we're working on a header that connects to the chain we're
+    // downloading.
+    if (header.hashPrevBlock != m_redownload_buffer_last_hash) {
+        LogPrint(BCLog::NET, "Initial headers sync aborted with peer=%d: non-continuous headers at height=%i (redownload phase)\n", m_id, next_height);
+        return false;
+    }
+
+    m_process_all_remaining_headers = true;
 
     // If we're at a header for which we previously stored a commitment, verify
     // it is correct. Failure will result in aborting download.

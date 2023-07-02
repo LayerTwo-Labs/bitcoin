@@ -494,7 +494,7 @@ bool SidechainClient::CreateBMMBlock(ChainstateManager& chainman, const CTxMemPo
 bool SidechainClient::SubmitBMMBlock(ChainstateManager& chainman, const CBlock& block)
 {
     std::shared_ptr<const CBlock> shared_pblock = std::make_shared<const CBlock>(block);
-    return chainman.ProcessNewBlock(shared_pblock, true, true, NULL);
+    return chainman.ProcessNewBlock(shared_pblock, true, NULL);
 }
 
 bool SidechainClient::GetAverageFees(int nBlocks, int nStartHeight, CAmount& nAverageFee)
