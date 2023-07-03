@@ -2526,33 +2526,14 @@ bool PeerManagerImpl::IsContinuationOfLowWorkHeadersSync(Peer& peer, CNode& pfro
 
 bool PeerManagerImpl::TryLowWorkHeadersSync(Peer& peer, CNode& pfrom, const CBlockIndex* chain_start_header, std::vector<CBlockHeader>& headers)
 {
-    // Only try to sync with this peer if their headers message was full;
-    // otherwise they don't have more headers after this so no point in
-    // trying to sync their too-little-work chain.
-    if (headers.size() == MAX_HEADERS_RESULTS) {
-        // Note: we could advance to the last header in this set that is
-        // known to us, rather than starting at the first header (which we
-        // may already have); however this is unlikely to matter much since
-        // ProcessHeadersMessage() already handles the case where all
-        // headers in a received message are already known and are
-        // ancestors of m_best_header or chainActive.Tip(), by skipping
-        // this logic in that case. So even if the first header in this set
-        // of headers is known, some header in this set must be new, so
-        // advancing to the first unknown header would be a small effect.
-        LOCK(peer.m_headers_sync_mutex);
-        peer.m_headers_sync.reset(new HeadersSyncState(peer.m_id, m_chainparams.GetConsensus(),
-            chain_start_header));
+    if (headers.empty())
+        return false;
 
-        // Now a HeadersSyncState object for tracking this synchronization
-        // is created, process the headers using it as normal. Failures are
-        // handled inside of IsContinuationOfLowWorkHeadersSync.
-        (void)IsContinuationOfLowWorkHeadersSync(peer, pfrom, headers);
-    } else {
-        LogPrint(BCLog::NET, "Ignoring low-work chain (height=%u) from peer=%d\n", chain_start_header->nHeight + headers.size(), pfrom.GetId());
-    }
+    LOCK(peer.m_headers_sync_mutex);
+    peer.m_headers_sync.reset(new HeadersSyncState(peer.m_id, m_chainparams.GetConsensus(), chain_start_header));
 
-    // The peer has not yet given us a chain that meets our work threshold,
-    // so we want to prevent further processing of the headers in any case.
+    (void)IsContinuationOfLowWorkHeadersSync(peer, pfrom, headers);
+
     headers = {};
     return true;
 }
