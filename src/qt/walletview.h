@@ -19,6 +19,9 @@ class SendCoinsRecipient;
 class TransactionView;
 class WalletModel;
 class AddressBookPage;
+class BIP118Page;
+class BIP119Page;
+class BIP345Page;
 
 QT_BEGIN_NAMESPACE
 class QModelIndex;
@@ -65,6 +68,10 @@ private:
     AddressBookPage *usedSendingAddressesPage;
     AddressBookPage *usedReceivingAddressesPage;
 
+    BIP118Page *bip118Page;
+    BIP119Page *bip119Page;
+    BIP345Page *bip345Page;
+
     TransactionView *transactionView;
 
     QProgressDialog* progressDialog{nullptr};
@@ -79,6 +86,10 @@ public Q_SLOTS:
     void gotoReceiveCoinsPage();
     /** Switch to send coins page */
     void gotoSendCoinsPage(QString addr = "");
+
+    void goto118Page();
+    void goto119Page();
+    void goto345Page();
 
     /** Show Sign/Verify Message dialog and switch to sign message tab */
     void gotoSignMessageTab(QString addr = "");
