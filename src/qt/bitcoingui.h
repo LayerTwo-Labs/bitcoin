@@ -164,6 +164,10 @@ private:
     QAction* m_wallet_selector_action = nullptr;
     QAction* m_mask_values_action{nullptr};
 
+    QAction* bip118Action = nullptr;
+    QAction* bip119Action = nullptr;
+    QAction* bip345Action = nullptr;
+
     QLabel *m_wallet_selector_label = nullptr;
     QComboBox* m_wallet_selector = nullptr;
 
@@ -290,6 +294,10 @@ public Q_SLOTS:
     void gotoLoadPSBT(bool from_clipboard = false);
     /** Enable history action when privacy is changed */
     void enableHistoryAction(bool privacy);
+
+    void goto118Page();
+    void goto119Page();
+    void goto345Page();
 
     /** Show open dialog */
     void openClicked();

@@ -278,6 +278,27 @@ void BitcoinGUI::createActions()
     historyAction->setShortcut(QKeySequence(QStringLiteral("Alt+4")));
     tabGroup->addAction(historyAction);
 
+    bip118Action = new QAction(platformStyle->SingleColorIcon(":/icons/bitcoin"), tr("&BIP 118"), this);
+    bip118Action->setStatusTip(tr("BIP 118"));
+    bip118Action->setToolTip(bip118Action->statusTip());
+    bip118Action->setCheckable(true);
+    bip118Action->setShortcut(QKeySequence(QStringLiteral("Alt+5")));
+    tabGroup->addAction(bip118Action);
+
+    bip119Action = new QAction(platformStyle->SingleColorIcon(":/icons/bitcoin"), tr("&BIP 119"), this);
+    bip119Action->setStatusTip(tr("BIP 119"));
+    bip119Action->setToolTip(bip119Action->statusTip());
+    bip119Action->setCheckable(true);
+    bip119Action->setShortcut(QKeySequence(QStringLiteral("Alt+6")));
+    tabGroup->addAction(bip119Action);
+
+    bip345Action = new QAction(platformStyle->SingleColorIcon(":/icons/bitcoin"), tr("&BIP 345"), this);
+    bip345Action->setStatusTip(tr("BIP 345"));
+    bip345Action->setToolTip(bip345Action->statusTip());
+    bip345Action->setCheckable(true);
+    bip345Action->setShortcut(QKeySequence(QStringLiteral("Alt+7")));
+    tabGroup->addAction(bip345Action);
+
 #ifdef ENABLE_WALLET
     // These showNormalIfMinimized are needed because Send Coins and Receive Coins
     // can be triggered from the tray menu, and need to show the GUI to be useful.
@@ -289,6 +310,15 @@ void BitcoinGUI::createActions()
     connect(receiveCoinsAction, &QAction::triggered, this, &BitcoinGUI::gotoReceiveCoinsPage);
     connect(historyAction, &QAction::triggered, [this]{ showNormalIfMinimized(); });
     connect(historyAction, &QAction::triggered, this, &BitcoinGUI::gotoHistoryPage);
+
+    connect(bip118Action, &QAction::triggered, [this]{ showNormalIfMinimized(); });
+    connect(bip118Action, &QAction::triggered, this, &BitcoinGUI::goto118Page);
+
+    connect(bip119Action, &QAction::triggered, [this]{ showNormalIfMinimized(); });
+    connect(bip119Action, &QAction::triggered, this, &BitcoinGUI::goto119Page);
+
+    connect(bip345Action, &QAction::triggered, [this]{ showNormalIfMinimized(); });
+    connect(bip345Action, &QAction::triggered, this, &BitcoinGUI::goto345Page);
 #endif // ENABLE_WALLET
 
     quitAction = new QAction(tr("E&xit"), this);
@@ -575,6 +605,10 @@ void BitcoinGUI::createToolBars()
         toolbar->addAction(sendCoinsAction);
         toolbar->addAction(receiveCoinsAction);
         toolbar->addAction(historyAction);
+        toolbar->addSeparator();
+        toolbar->addAction(bip118Action);
+        toolbar->addAction(bip119Action);
+        toolbar->addAction(bip345Action);
         overviewAction->setChecked(true);
 
 #ifdef ENABLE_WALLET
@@ -797,6 +831,9 @@ void BitcoinGUI::setWalletActionsEnabled(bool enabled)
     usedSendingAddressesAction->setEnabled(enabled);
     usedReceivingAddressesAction->setEnabled(enabled);
     openAction->setEnabled(enabled);
+    bip118Action->setEnabled(enabled);
+    bip119Action->setEnabled(enabled);
+    bip345Action->setEnabled(enabled);
     m_close_wallet_action->setEnabled(enabled);
     m_close_all_wallets_action->setEnabled(enabled);
 }
@@ -968,10 +1005,30 @@ void BitcoinGUI::gotoVerifyMessageTab(QString addr)
 {
     if (walletFrame) walletFrame->gotoVerifyMessageTab(addr);
 }
+
 void BitcoinGUI::gotoLoadPSBT(bool from_clipboard)
 {
     if (walletFrame) walletFrame->gotoLoadPSBT(from_clipboard);
 }
+
+void BitcoinGUI::goto118Page()
+{
+    bip118Action->setChecked(true);
+    if (walletFrame) walletFrame->goto118Page();
+}
+
+void BitcoinGUI::goto119Page()
+{
+    bip119Action->setChecked(true);
+    if (walletFrame) walletFrame->goto119Page();
+}
+
+void BitcoinGUI::goto345Page()
+{
+    bip345Action->setChecked(true);
+    if (walletFrame) walletFrame->goto345Page();
+}
+
 #endif // ENABLE_WALLET
 
 void BitcoinGUI::updateNetworkState()

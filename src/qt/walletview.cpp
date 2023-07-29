@@ -6,6 +6,9 @@
 
 #include <qt/addressbookpage.h>
 #include <qt/askpassphrasedialog.h>
+#include <qt/bip118page.h>
+#include <qt/bip119page.h>
+#include <qt/bip345page.h>
 #include <qt/clientmodel.h>
 #include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
@@ -63,6 +66,10 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
     sendCoinsPage = new SendCoinsDialog(platformStyle);
     sendCoinsPage->setModel(walletModel);
 
+    bip118Page = new BIP118Page(this);
+    bip119Page = new BIP119Page(this);
+    bip345Page = new BIP345Page(this);
+
     usedSendingAddressesPage = new AddressBookPage(platformStyle, AddressBookPage::ForEditing, AddressBookPage::SendingTab, this);
     usedSendingAddressesPage->setModel(walletModel->getAddressTableModel());
 
@@ -73,6 +80,10 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
     addWidget(transactionsPage);
     addWidget(receiveCoinsPage);
     addWidget(sendCoinsPage);
+
+    addWidget(bip118Page);
+    addWidget(bip119Page);
+    addWidget(bip345Page);
 
     connect(overviewPage, &OverviewPage::transactionClicked, this, &WalletView::transactionClicked);
     // Clicking on a transaction on the overview pre-selects the transaction on the transaction history page
@@ -164,6 +175,21 @@ void WalletView::gotoSendCoinsPage(QString addr)
 
     if (!addr.isEmpty())
         sendCoinsPage->setAddress(addr);
+}
+
+void WalletView::goto118Page()
+{
+    setCurrentWidget(bip118Page);
+}
+
+void WalletView::goto119Page()
+{
+    setCurrentWidget(bip119Page);
+}
+
+void WalletView::goto345Page()
+{
+    setCurrentWidget(bip345Page);
 }
 
 void WalletView::gotoSignMessageTab(QString addr)

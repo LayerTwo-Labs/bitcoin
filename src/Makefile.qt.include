@@ -16,6 +16,9 @@ include Makefile.qt_locale.include
 QT_FORMS_UI = \
   qt/forms/addressbookpage.ui \
   qt/forms/askpassphrasedialog.ui \
+  qt/forms/bip118page.ui \
+  qt/forms/bip119page.ui \
+  qt/forms/bip345page.ui \
   qt/forms/coincontroldialog.ui \
   qt/forms/createwalletdialog.ui \
   qt/forms/editaddressdialog.ui \
@@ -40,6 +43,9 @@ QT_MOC_CPP = \
   qt/moc_askpassphrasedialog.cpp \
   qt/moc_createwalletdialog.cpp \
   qt/moc_bantablemodel.cpp \
+  qt/moc_bip118page.cpp \
+  qt/moc_bip119page.cpp \
+  qt/moc_bip345page.cpp \
   qt/moc_bitcoin.cpp \
   qt/moc_bitcoinaddressvalidator.cpp \
   qt/moc_bitcoinamountfield.cpp \
@@ -110,6 +116,9 @@ BITCOIN_QT_H = \
   qt/addresstablemodel.h \
   qt/askpassphrasedialog.h \
   qt/bantablemodel.h \
+  qt/bip118page.h \
+  qt/bip119page.h \
+  qt/bip345page.h \
   qt/bitcoin.h \
   qt/bitcoinaddressvalidator.h \
   qt/bitcoinamountfield.h \
@@ -252,6 +261,9 @@ BITCOIN_QT_WALLET_CPP = \
   qt/addressbookpage.cpp \
   qt/addresstablemodel.cpp \
   qt/askpassphrasedialog.cpp \
+  qt/bip118page.cpp \
+  qt/bip119page.cpp \
+  qt/bip345page.cpp \
   qt/coincontroldialog.cpp \
   qt/coincontroltreewidget.cpp \
   qt/createwalletdialog.cpp \
