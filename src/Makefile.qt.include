@@ -60,9 +60,7 @@ QT_MOC_CPP = \
   qt/moc_initexecutor.cpp \
   qt/moc_intro.cpp \
   qt/moc_macdockiconhandler.cpp \
-  qt/moc_macnotificationhandler.cpp \
   qt/moc_modaloverlay.cpp \
-  qt/moc_notificator.cpp \
   qt/moc_openuridialog.cpp \
   qt/moc_optionsdialog.cpp \
   qt/moc_optionsmodel.cpp \
@@ -97,7 +95,6 @@ QT_MOC_CPP = \
 
 BITCOIN_MM = \
   qt/macdockiconhandler.mm \
-  qt/macnotificationhandler.mm \
   qt/macos_appnap.mm
 
 QT_MOC = \
@@ -135,11 +132,9 @@ BITCOIN_QT_H = \
   qt/initexecutor.h \
   qt/intro.h \
   qt/macdockiconhandler.h \
-  qt/macnotificationhandler.h \
   qt/macos_appnap.h \
   qt/modaloverlay.h \
   qt/networkstyle.h \
-  qt/notificator.h \
   qt/openuridialog.h \
   qt/optionsdialog.h \
   qt/optionsmodel.h \
@@ -242,7 +237,6 @@ BITCOIN_QT_BASE_CPP = \
   qt/intro.cpp \
   qt/modaloverlay.cpp \
   qt/networkstyle.cpp \
-  qt/notificator.cpp \
   qt/optionsdialog.cpp \
   qt/optionsmodel.cpp \
   qt/peertablemodel.cpp \

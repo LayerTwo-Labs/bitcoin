@@ -11,7 +11,6 @@
 #include <qt/guiutil.h>
 #include <qt/modaloverlay.h>
 #include <qt/networkstyle.h>
-#include <qt/notificator.h>
 #include <qt/openuridialog.h>
 #include <qt/optionsdialog.h>
 #include <qt/optionsmodel.h>
@@ -144,7 +143,6 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
     if (QSystemTrayIcon::isSystemTrayAvailable()) {
         createTrayIcon();
     }
-    notificator = new Notificator(QApplication::applicationName(), trayIcon, this);
 
     // Create status bar
     statusBar();
@@ -1264,7 +1262,6 @@ void BitcoinGUI::message(const QString& title, QString message, unsigned int sty
     QString strTitle{PACKAGE_NAME};
     // Default to information icon
     int nMBoxIcon = QMessageBox::Information;
-    int nNotifyIcon = Notificator::Information;
 
     QString msgType;
     if (!title.isEmpty()) {
@@ -1294,10 +1291,8 @@ void BitcoinGUI::message(const QString& title, QString message, unsigned int sty
 
     if (style & CClientUIInterface::ICON_ERROR) {
         nMBoxIcon = QMessageBox::Critical;
-        nNotifyIcon = Notificator::Critical;
     } else if (style & CClientUIInterface::ICON_WARNING) {
         nMBoxIcon = QMessageBox::Warning;
-        nNotifyIcon = Notificator::Warning;
     }
 
     if (style & CClientUIInterface::MODAL) {
@@ -1313,8 +1308,6 @@ void BitcoinGUI::message(const QString& title, QString message, unsigned int sty
         int r = mBox.exec();
         if (ret != nullptr)
             *ret = r == QMessageBox::Ok;
-    } else {
-        notificator->notify(static_cast<Notificator::Class>(nNotifyIcon), strTitle, message);
     }
 }
 
