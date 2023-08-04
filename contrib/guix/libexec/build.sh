@@ -254,6 +254,9 @@ mkdir -p "$DISTSRC"
     # shellcheck disable=SC2086
     env CONFIG_SITE="${BASEPREFIX}/${HOST}/share/config.site" \
         ./configure --prefix=/ \
+                    --disable-tests \
+                    --disable-bench \
+                    --disable-fuzz-binary \
                     --disable-ccache \
                     --disable-maintainer-mode \
                     --disable-dependency-tracking \
