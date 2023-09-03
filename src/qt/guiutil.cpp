@@ -505,8 +505,6 @@ fs::path static StartupShortcutPath()
     std::string chain = gArgs.GetChainName();
     if (chain == CBaseChainParams::MAIN)
         return GetSpecialFolderPath(CSIDL_STARTUP) / "Bitcoin.lnk";
-    if (chain == CBaseChainParams::TESTNET) // Remove this special case when CBaseChainParams::TESTNET = "testnet4"
-        return GetSpecialFolderPath(CSIDL_STARTUP) / "Bitcoin (testnet).lnk";
     return GetSpecialFolderPath(CSIDL_STARTUP) / fs::u8path(strprintf("Bitcoin (%s).lnk", chain));
 }
 

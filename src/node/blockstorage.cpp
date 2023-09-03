@@ -13,7 +13,6 @@
 #include <kernel/chainparams.h>
 #include <reverse_iterator.h>
 #include <shutdown.h>
-#include <signet.h>
 #include <streams.h>
 #include <undo.h>
 #include <util/fs.h>
@@ -759,11 +758,6 @@ bool ReadBlockFromDisk(CBlock& block, const FlatFilePos& pos, const Consensus::P
         filein >> block;
     } catch (const std::exception& e) {
         return error("%s: Deserialize or I/O error - %s at %s", __func__, e.what(), pos.ToString());
-    }
-
-    // Signet only: check block solution
-    if (consensusParams.signet_blocks && !CheckSignetBlockSolution(block, consensusParams)) {
-        return error("ReadBlockFromDisk: Errors in block solution at %s", pos.ToString());
     }
 
     return true;

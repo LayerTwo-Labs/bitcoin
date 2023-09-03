@@ -130,14 +130,6 @@ public:
     const ChainTxData& TxData() const { return chainTxData; }
 
     /**
-     * SigNetOptions holds configurations for creating a signet CChainParams.
-     */
-    struct SigNetOptions {
-        std::optional<std::vector<uint8_t>> challenge{};
-        std::optional<std::vector<std::string>> seeds{};
-    };
-
-    /**
      * VersionBitsParameters holds activation parameters
      */
     struct VersionBitsParameters {
@@ -156,9 +148,7 @@ public:
     };
 
     static std::unique_ptr<const CChainParams> RegTest(const RegTestOptions& options);
-    static std::unique_ptr<const CChainParams> SigNet(const SigNetOptions& options);
     static std::unique_ptr<const CChainParams> Main();
-    static std::unique_ptr<const CChainParams> TestNet();
 
 protected:
     CChainParams() {}

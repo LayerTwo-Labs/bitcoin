@@ -41,7 +41,6 @@
 #include <script/sigcache.h>
 #include <shutdown.h>
 #include <sidechainclient.h>
-#include <signet.h>
 #include <tinyformat.h>
 #include <txdb.h>
 #include <txmempool.h>

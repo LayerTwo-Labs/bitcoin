@@ -8,26 +8,11 @@
 #include <chainparamsseeds.h>
 #include <consensus/merkle.h>
 #include <deploymentinfo.h>
-#include <hash.h> // for signet block challenge hash
 #include <script/interpreter.h>
 #include <util/string.h>
 #include <util/system.h>
 
 #include <assert.h>
-
-void ReadSigNetArgs(const ArgsManager& args, CChainParams::SigNetOptions& options)
-{
-    if (args.IsArgSet("-signetseednode")) {
-        options.seeds.emplace(args.GetArgs("-signetseednode"));
-    }
-    if (args.IsArgSet("-signetchallenge")) {
-        const auto signet_challenge = args.GetArgs("-signetchallenge");
-        if (signet_challenge.size() != 1) {
-            throw std::runtime_error(strprintf("%s: -signetchallenge cannot be multiple values.", __func__));
-        }
-        options.challenge.emplace(ParseHex(signet_challenge[0]));
-    }
-}
 
 void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& options)
 {
