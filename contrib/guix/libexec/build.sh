@@ -214,7 +214,7 @@ mkdir -p "$OUTDIR"
 ###########################
 
 # CONFIGFLAGS
-CONFIGFLAGS="--enable-reduce-exports --disable-bench --disable-gui-tests --disable-fuzz-binary"
+CONFIGFLAGS="--disable-tests --enable-reduce-exports --disable-bench --disable-gui-tests --disable-fuzz-binary"
 
 # CFLAGS
 HOST_CFLAGS="-O2 -g"
@@ -253,9 +253,6 @@ mkdir -p "$DISTSRC"
     # shellcheck disable=SC2086
     env CONFIG_SITE="${BASEPREFIX}/${HOST}/share/config.site" \
         ./configure --prefix=/ \
-                    --disable-tests \
-                    --disable-bench \
-                    --disable-fuzz-binary \
                     --disable-ccache \
                     --disable-maintainer-mode \
                     --disable-dependency-tracking \
