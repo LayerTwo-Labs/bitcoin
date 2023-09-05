@@ -8,7 +8,6 @@
 #include <consensus/merkle.h>
 #include <consensus/validation.h>
 #include <node/miner.h>
-#include <pow.h>
 #include <random.h>
 #include <script/standard.h>
 #include <test/util/random.h>

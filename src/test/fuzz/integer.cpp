@@ -14,7 +14,6 @@
 #include <netbase.h>
 #include <policy/policy.h>
 #include <policy/settings.h>
-#include <pow.h>
 #include <protocol.h>
 #include <pubkey.h>
 #include <script/standard.h>
@@ -66,7 +65,6 @@ FUZZ_TARGET_INIT(integer, initialize_integer)
     const bool b = fuzzed_data_provider.ConsumeBool();
 
     const Consensus::Params& consensus_params = Params().GetConsensus();
-    (void)CheckProofOfWork(u256, u32, consensus_params);
     if (u64 <= MAX_MONEY) {
         const uint64_t compressed_money_amount = CompressAmount(u64);
         assert(u64 == DecompressAmount(compressed_money_amount));

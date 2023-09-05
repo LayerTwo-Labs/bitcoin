@@ -6,7 +6,6 @@
 #include <chainparams.h>
 #include <consensus/merkle.h>
 #include <consensus/validation.h>
-#include <pow.h>
 #include <test/util/setup_common.h>
 #include <txmempool.h>
 #include <validation.h>

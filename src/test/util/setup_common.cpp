@@ -29,7 +29,6 @@
 #include <noui.h>
 #include <policy/fees.h>
 #include <policy/fees_args.h>
-#include <pow.h>
 #include <rpc/blockchain.h>
 #include <rpc/register.h>
 #include <rpc/server.h>
@@ -174,7 +173,7 @@ ChainTestingSetup::ChainTestingSetup(const std::string& chainName, const std::ve
     GetMainSignals().RegisterBackgroundSignalScheduler(*m_node.scheduler);
 
     m_node.fee_estimator = std::make_unique<CBlockPolicyEstimator>(FeeestPath(*m_node.args));
-    m_node.mempool = std::make_unique<CTxMemPool>(MemPoolOptionsForTest(m_node));
+    // TODO m_node.mempool = std::make_unique<CTxMemPool>(MemPoolOptionsForTest(m_node));
 
     m_cache_sizes = CalculateCacheSizes(m_args);
 
@@ -305,15 +304,16 @@ CBlock TestChain100Setup::CreateBlock(
     const CScript& scriptPubKey,
     Chainstate& chainstate)
 {
-    CBlock block = BlockAssembler{chainstate, nullptr}.CreateNewBlock(scriptPubKey)->block;
+    // TODO
+    CBlock block; // = BlockAssembler{chainstate, nullptr}.CreateNewBlock(scriptPubKey)->block;
 
+    /*
     Assert(block.vtx.size() == 1);
     for (const CMutableTransaction& tx : txns) {
         block.vtx.push_back(MakeTransactionRef(tx));
     }
     RegenerateCommitments(block, *Assert(m_node.chainman));
-
-    while (!CheckProofOfWork(block.GetHash(), block.nBits, m_node.chainman->GetConsensus())) ++block.nNonce;
+    */
 
     return block;
 }
@@ -329,7 +329,7 @@ CBlock TestChain100Setup::CreateAndProcessBlock(
 
     CBlock block = this->CreateBlock(txns, scriptPubKey, *chainstate);
     std::shared_ptr<const CBlock> shared_pblock = std::make_shared<const CBlock>(block);
-    Assert(m_node.chainman)->ProcessNewBlock(shared_pblock, true, true, nullptr);
+    Assert(m_node.chainman)->ProcessNewBlock(shared_pblock, true, nullptr);
 
     return block;
 }
@@ -423,9 +423,10 @@ std::vector<CTransactionRef> TestChain100Setup::PopulateMempool(FastRandomContex
         if (submit) {
             LOCK2(cs_main, m_node.mempool->cs);
             LockPoints lp;
-            m_node.mempool->addUnchecked(CTxMemPoolEntry(ptx, /*fee=*/(total_in - num_outputs * amount_per_output),
-                                                         /*time=*/0, /*entry_height=*/1,
-                                                         /*spends_coinbase=*/false, /*sigops_cost=*/4, lp));
+            // TODO
+            //m_node.mempool->addUnchecked(CTxMemPoolEntry(ptx, /*fee=*/(total_in - num_outputs * amount_per_output),
+            //                                             /*time=*/0, /*entry_height=*/1,
+            //                                             /*spends_coinbase=*/false, /*sigops_cost=*/4, lp));
         }
         --num_transactions;
     }

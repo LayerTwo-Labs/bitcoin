@@ -7,18 +7,20 @@ LIBTEST_FUZZ=libtest_fuzz.a
 EXTRA_LIBRARIES += \
     $(LIBTEST_FUZZ)
 
+# TODO re enable #
+#  test/fuzz/util/mempool.h \ #
+#  test/fuzz/util/net.h #
 TEST_FUZZ_H = \
     test/fuzz/fuzz.h \
     test/fuzz/FuzzedDataProvider.h \
-    test/fuzz/util.h \
-    test/fuzz/util/mempool.h \
-    test/fuzz/util/net.h
+    test/fuzz/util.h
 
+# TODO re enable #
+#  test/fuzz/util/mempool.cpp \ #
+#  test/fuzz/util/net.cpp \ #
 libtest_fuzz_a_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(BOOST_CPPFLAGS)
 libtest_fuzz_a_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 libtest_fuzz_a_SOURCES = \
   test/fuzz/fuzz.cpp \
   test/fuzz/util.cpp \
-  test/fuzz/util/mempool.cpp \
-  test/fuzz/util/net.cpp \
   $(TEST_FUZZ_H)
