@@ -480,9 +480,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                 }
             }
 
-            if (opcode == OP_CAT ||
-                opcode == OP_SUBSTR ||
-                opcode == OP_LEFT ||
+            if (opcode == OP_LEFT ||
                 opcode == OP_RIGHT ||
                 opcode == OP_INVERT ||
                 opcode == OP_AND ||
@@ -937,6 +935,45 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     stack.push_back(bn.getvch());
                 }
                 break;
+
+
+                //
+                // Splice ops
+                //
+                case OP_CAT: {
+                    // (x1 x2 -- out)
+                    if (stack.size() < 2)
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+                    valtype& vch1 = stacktop(-2);
+                    valtype& vch2 = stacktop(-1);
+                    if (vch1.size() + vch2.size() > MAX_SCRIPT_ELEMENT_SIZE)
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+                    vch1.insert(vch1.end(), vch2.begin(), vch2.end());
+                    stack.pop_back();
+                } break;
+
+                case OP_SUBSTR: {
+                    // (in begin size -- out)
+                    if (stack.size() < 3)
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+                    valtype& vch = stacktop(-3);
+                    CScriptNum bnBegin(stacktop(-2), fRequireMinimal);
+                    CScriptNum bnEnd = CScriptNum(stacktop(-1), fRequireMinimal) += bnBegin;
+                    if (bnBegin < bnZero || bnEnd < bnBegin || bnEnd > MAX_SCRIPT_ELEMENT_SIZE)
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+                    if (bnBegin > vch.size())
+                        bnBegin = vch.size();
+                    if (bnEnd > vch.size())
+                        bnEnd = vch.size();
+                    if (bnEnd > bnBegin) {
+                        vch.erase(vch.begin() + bnEnd.getint(), vch.end());
+                        vch.erase(vch.begin(), vch.begin() + bnBegin.getint());
+                    } else {
+                        vch.clear();
+                    }
+                    stack.pop_back();
+                    stack.pop_back();
+                } break;
 
 
                 //
