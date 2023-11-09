@@ -96,7 +96,8 @@ static const char DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP = 'P';
 /**
  * Base object for sidechain related database entries
  */
-struct SidechainObj {
+class SidechainObj {
+public:
     char sidechainop;
 
     SidechainObj(void) { }
@@ -110,7 +111,8 @@ struct SidechainObj {
 /**
  * Sidechain individual withdrawal database object
  */
-struct SidechainWithdrawal: public SidechainObj {
+class SidechainWithdrawal: public SidechainObj {
+public:
     uint8_t nSidechain;
     std::string strDestination;
     std::string strRefundDestination;
@@ -147,7 +149,8 @@ struct SidechainWithdrawal: public SidechainObj {
 /**
  * Sidechain withdrawal bundle proposal database object
  */
-struct SidechainWithdrawalBundle: public SidechainObj {
+class SidechainWithdrawalBundle: public SidechainObj {
+public:
     uint8_t nSidechain;
     CMutableTransaction tx;
     std::vector<uint256> vWithdrawalID; // The id in ldb of bundle's withdrawals
@@ -188,7 +191,8 @@ struct SidechainWithdrawalBundle: public SidechainObj {
 /**
  * Sidechain deposit database object
  */
-struct SidechainDeposit : public SidechainObj {
+class SidechainDeposit : public SidechainObj {
+public:
     uint8_t nSidechain;
     std::string strDest;
     CAmount amtUserPayout;

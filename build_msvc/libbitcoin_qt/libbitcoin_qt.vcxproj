@@ -11,6 +11,9 @@
     <ClCompile Include="..\..\src\qt\addresstablemodel.cpp" />
     <ClCompile Include="..\..\src\qt\askpassphrasedialog.cpp" />
     <ClCompile Include="..\..\src\qt\bantablemodel.cpp" />
+    <ClCompile Include="..\..\src\qt\bip118page.cpp" />
+    <ClCompile Include="..\..\src\qt\bip119page.cpp" />
+    <ClCompile Include="..\..\src\qt\bip345page.cpp" />
     <ClCompile Include="..\..\src\qt\bitcoin.cpp" />
     <ClCompile Include="..\..\src\qt\bitcoinaddressvalidator.cpp" />
     <ClCompile Include="..\..\src\qt\bitcoinamountfield.cpp" />
@@ -28,7 +31,6 @@
     <ClCompile Include="..\..\src\qt\intro.cpp" />
     <ClCompile Include="..\..\src\qt\modaloverlay.cpp" />
     <ClCompile Include="..\..\src\qt\networkstyle.cpp" />
-    <ClCompile Include="..\..\src\qt\notificator.cpp" />
     <ClCompile Include="..\..\src\qt\openuridialog.cpp" />
     <ClCompile Include="..\..\src\qt\optionsdialog.cpp" />
     <ClCompile Include="..\..\src\qt\optionsmodel.cpp" />
@@ -68,6 +70,9 @@
     <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_addresstablemodel.cpp" />
     <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_askpassphrasedialog.cpp" />
     <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_bantablemodel.cpp" />
+    <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_bip118page.cpp" />
+    <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_bip119page.cpp" />
+    <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_bip345page.cpp" />
     <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_bitcoin.cpp" />
     <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_bitcoinaddressvalidator.cpp" />
     <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_bitcoinamountfield.cpp" />
@@ -84,7 +89,6 @@
     <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_intro.cpp" />
     <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_modaloverlay.cpp" />
     <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_networkstyle.cpp" />
-    <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_notificator.cpp" />
     <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_openuridialog.cpp" />
     <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_optionsdialog.cpp" />
     <ClCompile Include="$(GeneratedFilesOutDir)\moc\moc_optionsmodel.cpp" />
