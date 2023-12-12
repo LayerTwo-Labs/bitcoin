@@ -213,6 +213,8 @@ enum opcodetype
     // vaults - OP_SUCCESS187 and OP_SUCCESS188
     OP_VAULT = 0xbb,
     OP_VAULT_RECOVER = 0xbc,
+    OP_CHECKSIGFROMSTACK = 0xc1,
+    OP_CHECKSIGFROMSTACKVERIFY = 0xc2,
 };
 
 // Maximum value that an opcode can be
