@@ -171,6 +171,10 @@ enum : uint32_t {
     // Policy: unauthorized vault recovery transactions have limited outputs.
     SCRIPT_VERIFY_VAULT_UNAUTH_RECOVERY_STRUCTURE = (1U << 28),
 
+    // Signature checking assumes no sighash byte after the DER signature
+    //
+    SCRIPT_NO_SIGHASH_BYTE = (1U << 31),
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER
