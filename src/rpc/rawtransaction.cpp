@@ -557,6 +557,7 @@ static RPCHelpMan decodescript()
         case TxoutType::SCRIPTHASH:
         case TxoutType::WITNESS_UNKNOWN:
         case TxoutType::WITNESS_V1_TAPROOT:
+        case TxoutType::TX_BARE_DEFAULT_CHECK_TEMPLATE_VERIFY_HASH:
             // Should not be wrapped
             return false;
         } // no default case, so the compiler can warn about missing cases
@@ -599,6 +600,7 @@ static RPCHelpMan decodescript()
             case TxoutType::WITNESS_V0_KEYHASH:
             case TxoutType::WITNESS_V0_SCRIPTHASH:
             case TxoutType::WITNESS_V1_TAPROOT:
+            case TxoutType::TX_BARE_DEFAULT_CHECK_TEMPLATE_VERIFY_HASH:
                 // Should not be wrapped
                 return false;
             } // no default case, so the compiler can warn about missing cases
@@ -1700,6 +1702,52 @@ static RPCHelpMan utxoupdatepsbt()
         HidingSigningProvider(&provider, /*hide_secret=*/true, /*hide_origin=*/false),
         /*sighash_type=*/SIGHASH_ALL,
         /*finalize=*/false);
+    HidingSigningProvider public_provider(&provider, /*hide_secret=*/true, /*hide_origin=*/false);
+
+    // Fetch previous transactions (inputs):
+    CCoinsView viewDummy;
+    CCoinsViewCache view(&viewDummy);
+    {
+        NodeContext& node = EnsureAnyNodeContext(request.context);
+        const CTxMemPool& mempool = EnsureMemPool(node);
+        ChainstateManager& chainman = EnsureChainman(node);
+        LOCK2(cs_main, mempool.cs);
+        CCoinsViewCache &viewChain = chainman.ActiveChainstate().CoinsTip();
+        CCoinsViewMemPool viewMempool(&viewChain, mempool);
+        view.SetBackend(viewMempool); // temporarily switch cache backend to db+mempool view
+
+        for (const CTxIn& txin : psbtx.tx->vin) {
+            view.AccessCoin(txin.prevout); // Load entries from viewChain into view; can fail.
+        }
+
+        view.SetBackend(viewDummy); // switch back to avoid locking mempool for too long
+    }
+
+    // Fill the inputs
+    PrecomputedTransactionData txdata = PrecomputePSBTData(psbtx);
+    for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
+        PSBTInput& input = psbtx.inputs.at(i);
+
+        if (input.non_witness_utxo || !input.witness_utxo.IsNull()) {
+            continue;
+        }
+
+        const Coin& coin = view.AccessCoin(psbtx.tx->vin[i].prevout);
+
+        if (IsSegWitOutput(provider, coin.out.scriptPubKey)) {
+            input.witness_utxo = coin.out;
+        }
+
+        // Update script/keypath information using descriptor data.
+        // Note that SignPSBTInput does a lot more than just constructing ECDSA signatures
+        // we don't actually care about those here, in fact.
+        SignPSBTInput(public_provider, psbtx, i, &txdata, /*sighash=*/1);
+    }
+
+    // Update script/keypath information using descriptor data.
+    for (unsigned int i = 0; i < psbtx.tx->vout.size(); ++i) {
+        UpdatePSBTOutput(public_provider, psbtx, i);
+    }
 
     CDataStream ssTx(SER_NETWORK, PROTOCOL_VERSION);
     ssTx << psbtx;
