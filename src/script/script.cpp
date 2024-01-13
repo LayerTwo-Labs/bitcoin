@@ -367,3 +367,165 @@ bool CheckMinimalPush(const std::vector<unsigned char>& data, opcodetype opcode)
     }
     return true;
 }
+
+bool CScript::IsWithdrawalBundleFailCommit(uint256& hashWithdrawalBundle) const
+{
+    // Check script size
+    size_t size = this->size();
+    if (size != 37) // sha256 hash + opcodes
+        return false;
+
+    // Check script header
+    if ((*this)[0] != OP_RETURN ||
+            (*this)[1] != 0xFA ||
+            (*this)[2] != 0x86 ||
+            (*this)[3] != 0xC6 ||
+            (*this)[4] != 0x89)
+        return false;
+
+    hashWithdrawalBundle = uint256(std::vector<unsigned char>(this->begin() + 5, this->begin() + 37));
+
+    if (hashWithdrawalBundle.IsNull())
+        return false;
+
+    return true;
+}
+
+bool CScript::IsWithdrawalBundleSpentCommit(uint256& hashWithdrawalBundle) const
+{
+    // Check script size
+    size_t size = this->size();
+    if (size != 37) // sha256 hash + opcodes
+        return false;
+
+    // Check script header
+    if ((*this)[0] != OP_RETURN ||
+            (*this)[1] != 0xFB ||
+            (*this)[2] != 0x53 ||
+            (*this)[3] != 0x45 ||
+            (*this)[4] != 0xDE)
+        return false;
+
+    hashWithdrawalBundle = uint256(std::vector<unsigned char>(this->begin() + 5, this->begin() + 37));
+
+    if (hashWithdrawalBundle.IsNull())
+        return false;
+
+    return true;
+}
+
+bool CScript::IsWithdrawalRefundRequest(uint256& wtID, std::vector<unsigned char>& vchSig) const
+{
+    // Check script size
+    size_t size = this->size();
+    if (size != 102) // sha256 hash (32 bytes) + opcodes + sig (65 bytes)
+        return false;
+
+    // Check script header
+    if ((*this)[0] != OP_RETURN ||
+            (*this)[1] != 0xFC ||
+            (*this)[2] != 0xD2 ||
+            (*this)[3] != 0xE5 ||
+            (*this)[4] != 0x46)
+        return false;
+
+    wtID = uint256(std::vector<unsigned char>(this->begin() + 5, this->begin() + 37));
+    vchSig = std::vector<unsigned char>(this->begin() + 37, this->end());
+
+    if (wtID.IsNull())
+        return false;
+    if (vchSig.empty())
+        return false;
+
+    return true;
+}
+
+bool CScript::IsPrevBlockCommit(uint256& hashPrevMain, uint256& hashPrevSide) const
+{
+    // Check script size
+    size_t size = this->size();
+    if (size != 69) // sha256 hash x 2 + opcodes
+        return false;
+
+    // Check script header
+    if ((*this)[0] != OP_RETURN ||
+            (*this)[1] != 0xFD ||
+            (*this)[2] != 0x7A ||
+            (*this)[3] != 0xD1 ||
+            (*this)[4] != 0xEF)
+        return false;
+
+    hashPrevMain = uint256(std::vector<unsigned char>(this->begin() + 5, this->begin() + 37));
+    hashPrevSide = uint256(std::vector<unsigned char>(this->begin() + 37, this->end()));
+
+    if (hashPrevMain.IsNull() || hashPrevSide.IsNull())
+        return false;
+
+    return true;
+}
+
+bool CScript::IsWithdrawalBundleHashCommit(uint256& hashWithdrawalBundle) const
+{
+    // Check script size
+    size_t size = this->size();
+    if (size != 37) // sha256 hash + opcodes
+        return false;
+
+    // Check script header
+    if ((*this)[0] != OP_RETURN ||
+            (*this)[1] != 0xEF ||
+            (*this)[2] != 0x5D ||
+            (*this)[3] != 0x1D ||
+            (*this)[4] != 0xFE)
+        return false;
+
+    hashWithdrawalBundle = uint256(std::vector<unsigned char>(this->begin() + 5, this->begin() + 37));
+
+    if (hashWithdrawalBundle.IsNull())
+        return false;
+
+    return true;
+}
+
+bool CScript::IsBlockVersionCommit(int32_t& nVersion) const
+{
+    // Check script size
+    size_t size = this->size();
+    if (size != 9) // int32 + opcodes
+        return false;
+
+    // Check script header
+    if ((*this)[0] != OP_RETURN ||
+            (*this)[1] != 0xA7 ||
+            (*this)[2] != 0xE6 ||
+            (*this)[3] != 0x7E ||
+            (*this)[4] != 0x1F)
+        return false;
+
+    CScriptNum num(std::vector<unsigned char>(this->begin() + 5, this->begin() + 9), false);
+
+    nVersion = num.getint();
+
+    return true;
+}
+
+bool CScript::IsSidechainObj(std::vector<unsigned char>& vch) const
+{
+    // Check script size
+    size_t size = this->size();
+    if (size < 5)
+        return false;
+
+    // Check script header
+    if ((*this)[0] != OP_RETURN ||
+            (*this)[1] != 0xAC ||
+            (*this)[2] != 0xDC ||
+            (*this)[3] != 0xF6 ||
+            (*this)[4] != 0x6F)
+        return false;
+
+    vch = std::vector<unsigned char>(this->begin() + 5, this->end());
+
+    return true;
+}
+

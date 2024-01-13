@@ -244,7 +244,6 @@ BITCOIN_CORE_H = \
   policy/policy.h \
   policy/rbf.h \
   policy/settings.h \
-  pow.h \
   protocol.h \
   psbt.h \
   random.h \
@@ -365,8 +364,10 @@ BITCOIN_CORE_H = \
   zmq/zmqnotificationinterface.h \
   zmq/zmqpublishnotifier.h \
   zmq/zmqrpc.h \
-  zmq/zmqutil.h
-
+  zmq/zmqutil.h \
+  bmmcache.h \
+  sidechain.h \
+  sidechainclient.h
 
 obj/build.h: FORCE
 	@$(MKDIR_P) $(builddir)/obj
@@ -441,7 +442,6 @@ libbitcoin_node_a_SOURCES = \
   policy/packages.cpp \
   policy/rbf.cpp \
   policy/settings.cpp \
-  pow.cpp \
   rest.cpp \
   rpc/blockchain.cpp \
   rpc/fees.cpp \
@@ -467,6 +467,9 @@ libbitcoin_node_a_SOURCES = \
   validation.cpp \
   validationinterface.cpp \
   versionbits.cpp \
+  bmmcache.cpp \
+  sidechain.cpp \
+  sidechainclient.cpp \
   $(BITCOIN_CORE_H)
 
 if ENABLE_WALLET
@@ -956,7 +959,6 @@ libbitcoinkernel_la_SOURCES = \
   policy/policy.cpp \
   policy/rbf.cpp \
   policy/settings.cpp \
-  pow.cpp \
   primitives/block.cpp \
   primitives/transaction.cpp \
   pubkey.cpp \

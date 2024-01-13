@@ -21,6 +21,7 @@
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
 #include <kernel/coinstats.h>
+#include <key_io.h>
 #include <logging/timer.h>
 #include <net.h>
 #include <net_processing.h>
@@ -32,6 +33,7 @@
 #include <rpc/server.h>
 #include <rpc/server_util.h>
 #include <rpc/util.h>
+#include <random.h>
 #include <script/descriptor.h>
 #include <streams.h>
 #include <sync.h>
@@ -47,6 +49,10 @@
 #include <validationinterface.h>
 #include <versionbits.h>
 #include <warnings.h>
+
+#include <bmmcache.h>
+#include <sidechain.h>
+#include <sidechainclient.h>
 
 #include <stdint.h>
 
@@ -70,30 +76,6 @@ struct CUpdatedBlock
 static GlobalMutex cs_blockchange;
 static std::condition_variable cond_blockchange;
 static CUpdatedBlock latestblock GUARDED_BY(cs_blockchange);
-
-/* Calculate the difficulty for a given block index.
- */
-double GetDifficulty(const CBlockIndex* blockindex)
-{
-    CHECK_NONFATAL(blockindex);
-
-    int nShift = (blockindex->nBits >> 24) & 0xff;
-    double dDiff =
-        (double)0x0000ffff / (double)(blockindex->nBits & 0x00ffffff);
-
-    while (nShift < 29)
-    {
-        dDiff *= 256.0;
-        nShift++;
-    }
-    while (nShift > 29)
-    {
-        dDiff /= 256.0;
-        nShift--;
-    }
-
-    return dDiff;
-}
 
 static int ComputeNextBlockAndDepth(const CBlockIndex* tip, const CBlockIndex* blockindex, const CBlockIndex*& next)
 {
@@ -149,10 +131,6 @@ UniValue blockheaderToJSON(const CBlockIndex* tip, const CBlockIndex* blockindex
     result.pushKV("merkleroot", blockindex->hashMerkleRoot.GetHex());
     result.pushKV("time", (int64_t)blockindex->nTime);
     result.pushKV("mediantime", (int64_t)blockindex->GetMedianTimePast());
-    result.pushKV("nonce", (uint64_t)blockindex->nNonce);
-    result.pushKV("bits", strprintf("%08x", blockindex->nBits));
-    result.pushKV("difficulty", GetDifficulty(blockindex));
-    result.pushKV("chainwork", blockindex->nChainWork.GetHex());
     result.pushKV("nTx", (uint64_t)blockindex->nTx);
 
     if (blockindex->pprev)
@@ -403,26 +381,6 @@ static RPCHelpMan syncwithvalidationinterfacequeue()
     };
 }
 
-static RPCHelpMan getdifficulty()
-{
-    return RPCHelpMan{"getdifficulty",
-                "\nReturns the proof-of-work difficulty as a multiple of the minimum difficulty.\n",
-                {},
-                RPCResult{
-                    RPCResult::Type::NUM, "", "the proof-of-work difficulty as a multiple of the minimum difficulty."},
-                RPCExamples{
-                    HelpExampleCli("getdifficulty", "")
-            + HelpExampleRpc("getdifficulty", "")
-                },
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    ChainstateManager& chainman = EnsureAnyChainman(request.context);
-    LOCK(cs_main);
-    return GetDifficulty(chainman.ActiveChain().Tip());
-},
-    };
-}
-
 static RPCHelpMan getblockfrompeer()
 {
     return RPCHelpMan{
@@ -529,8 +487,6 @@ static RPCHelpMan getblockheader()
                             {RPCResult::Type::NUM_TIME, "mediantime", "The median block time expressed in " + UNIX_EPOCH_TIME},
                             {RPCResult::Type::NUM, "nonce", "The nonce"},
                             {RPCResult::Type::STR_HEX, "bits", "The bits"},
-                            {RPCResult::Type::NUM, "difficulty", "The difficulty"},
-                            {RPCResult::Type::STR_HEX, "chainwork", "Expected number of hashes required to produce the current chain"},
                             {RPCResult::Type::NUM, "nTx", "The number of transactions in the block"},
                             {RPCResult::Type::STR_HEX, "previousblockhash", /*optional=*/true, "The hash of the previous block (if available)"},
                             {RPCResult::Type::STR_HEX, "nextblockhash", /*optional=*/true, "The hash of the next block (if available)"},
@@ -674,8 +630,6 @@ static RPCHelpMan getblock()
                     {RPCResult::Type::NUM_TIME, "mediantime", "The median block time expressed in " + UNIX_EPOCH_TIME},
                     {RPCResult::Type::NUM, "nonce", "The nonce"},
                     {RPCResult::Type::STR_HEX, "bits", "The bits"},
-                    {RPCResult::Type::NUM, "difficulty", "The difficulty"},
-                    {RPCResult::Type::STR_HEX, "chainwork", "Expected number of hashes required to produce the chain up to this block (in hex)"},
                     {RPCResult::Type::NUM, "nTx", "The number of transactions in the block"},
                     {RPCResult::Type::STR_HEX, "previousblockhash", /*optional=*/true, "The hash of the previous block (if available)"},
                     {RPCResult::Type::STR_HEX, "nextblockhash", /*optional=*/true, "The hash of the next block (if available)"},
@@ -1227,12 +1181,10 @@ RPCHelpMan getblockchaininfo()
                 {RPCResult::Type::NUM, "blocks", "the height of the most-work fully-validated chain. The genesis block has height 0"},
                 {RPCResult::Type::NUM, "headers", "the current number of headers we have validated"},
                 {RPCResult::Type::STR, "bestblockhash", "the hash of the currently best block"},
-                {RPCResult::Type::NUM, "difficulty", "the current difficulty"},
                 {RPCResult::Type::NUM_TIME, "time", "The block time expressed in " + UNIX_EPOCH_TIME},
                 {RPCResult::Type::NUM_TIME, "mediantime", "The median block time expressed in " + UNIX_EPOCH_TIME},
                 {RPCResult::Type::NUM, "verificationprogress", "estimate of verification progress [0..1]"},
                 {RPCResult::Type::BOOL, "initialblockdownload", "(debug information) estimate of whether this node is in Initial Block Download mode"},
-                {RPCResult::Type::STR_HEX, "chainwork", "total amount of work in active chain, in hexadecimal"},
                 {RPCResult::Type::NUM, "size_on_disk", "the estimated size of the block and undo files on disk"},
                 {RPCResult::Type::BOOL, "pruned", "if the blocks are subject to pruning"},
                 {RPCResult::Type::NUM, "pruneheight", /*optional=*/true, "height of the last block pruned, plus one (only present if pruning is enabled)"},
@@ -1257,12 +1209,10 @@ RPCHelpMan getblockchaininfo()
     obj.pushKV("blocks", height);
     obj.pushKV("headers", chainman.m_best_header ? chainman.m_best_header->nHeight : -1);
     obj.pushKV("bestblockhash", tip.GetBlockHash().GetHex());
-    obj.pushKV("difficulty", GetDifficulty(&tip));
     obj.pushKV("time", tip.GetBlockTime());
     obj.pushKV("mediantime", tip.GetMedianTimePast());
     obj.pushKV("verificationprogress", GuessVerificationProgress(chainman.GetParams().TxData(), &tip));
     obj.pushKV("initialblockdownload", chainman.IsInitialBlockDownload());
-    obj.pushKV("chainwork", tip.nChainWork.GetHex());
     obj.pushKV("size_on_disk", chainman.m_blockman.CalculateCurrentUsage());
     obj.pushKV("pruned", chainman.m_blockman.IsPruneMode());
     if (chainman.m_blockman.IsPruneMode()) {
@@ -1474,46 +1424,6 @@ static RPCHelpMan getchaintips()
     }
 
     return res;
-},
-    };
-}
-
-static RPCHelpMan preciousblock()
-{
-    return RPCHelpMan{"preciousblock",
-                "\nTreats a block as if it were received before others with the same work.\n"
-                "\nA later preciousblock call can override the effect of an earlier one.\n"
-                "\nThe effects of preciousblock are not retained across restarts.\n",
-                {
-                    {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "the hash of the block to mark as precious"},
-                },
-                RPCResult{RPCResult::Type::NONE, "", ""},
-                RPCExamples{
-                    HelpExampleCli("preciousblock", "\"blockhash\"")
-            + HelpExampleRpc("preciousblock", "\"blockhash\"")
-                },
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    uint256 hash(ParseHashV(request.params[0], "blockhash"));
-    CBlockIndex* pblockindex;
-
-    ChainstateManager& chainman = EnsureAnyChainman(request.context);
-    {
-        LOCK(cs_main);
-        pblockindex = chainman.m_blockman.LookupBlockIndex(hash);
-        if (!pblockindex) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
-        }
-    }
-
-    BlockValidationState state;
-    chainman.ActiveChainstate().PreciousBlock(state, pblockindex);
-
-    if (!state.IsValid()) {
-        throw JSONRPCError(RPC_DATABASE_ERROR, state.ToString());
-    }
-
-    return UniValue::VNULL;
 },
     };
 }
@@ -2698,104 +2608,96 @@ UniValue CreateUTXOSnapshot(
     return result;
 }
 
-static RPCHelpMan loadtxoutset()
+static RPCHelpMan refreshbmm()
 {
-    return RPCHelpMan{
-        "loadtxoutset",
-        "Load the serialized UTXO set from disk.\n"
-        "Once this snapshot is loaded, its contents will be "
-        "deserialized into a second chainstate data structure, which is then used to sync to "
-        "the network's tip. "
-        "Meanwhile, the original chainstate will complete the initial block download process in "
-        "the background, eventually validating up to the block that the snapshot is based upon.\n\n"
-
-        "The result is a usable bitcoind instance that is current with the network tip in a "
-        "matter of minutes rather than hours. UTXO snapshot are typically obtained from "
-        "third-party sources (HTTP, torrent, etc.) which is reasonable since their "
-        "contents are always checked by hash.\n\n"
-
-        "You can find more information on this process in the `assumeutxo` design "
-        "document (<https://github.com/bitcoin/bitcoin/blob/master/doc/design/assumeutxo.md>).",
+    return RPCHelpMan{"refreshbmm",
+        "Refresh automated BMM. Basic testing implementation.\n",
         {
-            {"path",
-                RPCArg::Type::STR,
-                RPCArg::Optional::NO,
-                "path to the snapshot file. If relative, will be prefixed by datadir."},
+            {"amount", RPCArg::Type::NUM, RPCArg::Optional::NO, "Amount to pay mainchain miner for including BMM request."},
+            {"createnew", RPCArg::Type::BOOL, RPCArg::Default{true}, "Create a new BMM block if possible. Default true."},
+            {"prevblock", RPCArg::Type::STR, RPCArg::Default{""}, "Hash of sidechain block to build on. Default chaintip."},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
-                {
-                    {RPCResult::Type::NUM, "coins_loaded", "the number of coins loaded from the snapshot"},
-                    {RPCResult::Type::STR_HEX, "tip_hash", "the hash of the base of the snapshot"},
-                    {RPCResult::Type::NUM, "base_height", "the height of the base of the snapshot"},
-                    {RPCResult::Type::STR, "path", "the absolute path that the snapshot was loaded from"},
-                }
-        },
+            {
+                {RPCResult::Type::STR, "hash_last_main_block", ""},
+                {RPCResult::Type::STR, "bmm_block_created", ""},
+                {RPCResult::Type::STR, "bmm_block_submitted", ""},
+                {RPCResult::Type::STR, "bmm_block_submitted_blind", ""},
+                {RPCResult::Type::NUM, "ntxn", ""},
+                {RPCResult::Type::NUM, "nfees", ""},
+                {RPCResult::Type::STR, "txid", ""},
+                {RPCResult::Type::STR, "error", ""},
+            }},
         RPCExamples{
-            HelpExampleCli("loadtxoutset", "utxo.dat")
-        },
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    NodeContext& node = EnsureAnyNodeContext(request.context);
-    ChainstateManager& chainman = EnsureChainman(node);
-    fs::path path{AbsPathForConfigVal(EnsureArgsman(node), fs::u8path(request.params[0].get_str()))};
+            HelpExampleCli("refreshbmm", "")
+            + HelpExampleRpc("refreshbmm", "")
+    LOCK(cs_main);
+    Chainstate& active_chainstate = chainman.ActiveChainstate();
 
-    FILE* file{fsbridge::fopen(path, "rb")};
-    AutoFile afile{file};
-    if (afile.IsNull()) {
-        throw JSONRPCError(
-            RPC_INVALID_PARAMETER,
-            "Couldn't open file " + path.u8string() + " for reading.");
+    CTxMemPool& mempool = EnsureMemPool(node);
+
+    bool fReorg = false;
+    std::vector<uint256> vDisconnected;
+    if (!UpdateMainBlockHashCache(fReorg, vDisconnected))
+        throw JSONRPCError(RPC_MISC_ERROR, "Failed to update mainchain block cache!");
+
+    if (fReorg)
+        HandleMainchainReorg(vDisconnected);
+
+    CAmount amount = AmountFromValue(request.params[0]);
+    if (amount <= 0)
+        throw JSONRPCError(RPC_TYPE_ERROR, "Invalid amount for BMM!");
+
+    // Whether or not to create a new BMM block / request if possible. If set
+    // false, we will only check for BMM commits in the mainchain and try to
+    // connect those blocks but not generate a new BMM block and request.
+    bool fCreateNew = request.params.size() >= 2 ? request.params[1].get_bool() : true;
+
+    // If hashPrevBlock is set, we will build a block on top of that block
+    // instead of the current sidechain tip.
+    uint256 hashPrevBlock;
+    if (request.params.size() == 3) {
+        LOCK(cs_main);
+
+        hashPrevBlock = uint256S(request.params[2].get_str());
+        if (hashPrevBlock.IsNull())
+            throw JSONRPCError(RPC_MISC_ERROR, "Invalid prev block hash (null)!");
+
+        const CBlockIndex* pblockindex = chainman.m_blockman.LookupBlockIndex(hashPrevBlock);
+        // Check if the prevblock is in the side: chain
+        if (!pblockindex)
+            throw JSONRPCError(RPC_MISC_ERROR, "Prev block does not exist!");
     }
 
-    SnapshotMetadata metadata;
-    afile >> metadata;
+    if (!CheckMainchainConnection())
+        throw JSONRPCError(RPC_MISC_ERROR, "Must be connected to mainchain (not connected)!");
 
-    uint256 base_blockhash = metadata.m_base_blockhash;
-    if (!chainman.GetParams().AssumeutxoForBlockhash(base_blockhash).has_value()) {
-        throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Unable to load UTXO snapshot, "
-            "assumeutxo block hash in snapshot metadata not recognized (%s)", base_blockhash.ToString()));
-    }
-    int max_secs_to_wait_for_headers = 60 * 10;
-    CBlockIndex* snapshot_start_block = nullptr;
+    SetNetworkActive(true, "refreshbmm RPC command issued");
 
-    LogPrintf("[snapshot] waiting to see blockheader %s in headers chain before snapshot activation\n",
-        base_blockhash.ToString());
+    SidechainClient client;
+    std::string strError = "";
+    uint256 hashCreated;
+    uint256 hashConnected;
+    uint256 hashConnectedBlind;
+    uint256 txid;
+    int ntxn = 0;
+    CAmount nFees = 0;
+    const CTxMemPool* pool = &mempool;
+    if (!client.RefreshBMM(chainman, pool, amount, strError, hashCreated, hashConnected, hashConnectedBlind, txid, ntxn, nFees, fCreateNew, hashPrevBlock))
+        throw JSONRPCError(RPC_MISC_ERROR, strError);
 
-    while (max_secs_to_wait_for_headers > 0) {
-        snapshot_start_block = WITH_LOCK(::cs_main,
-            return chainman.m_blockman.LookupBlockIndex(base_blockhash));
-        max_secs_to_wait_for_headers -= 1;
 
-        if (!IsRPCRunning()) {
-            throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "Shutting down");
-        }
-
-        if (!snapshot_start_block) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        } else {
-            break;
-        }
-    }
-
-    if (!snapshot_start_block) {
-        LogPrintf("[snapshot] timed out waiting for snapshot start blockheader %s\n",
-            base_blockhash.ToString());
-        throw JSONRPCError(
-            RPC_INTERNAL_ERROR,
-            "Timed out waiting for base block header to appear in headers chain");
-    }
-    if (!chainman.ActivateSnapshot(afile, metadata, false)) {
-        throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to load UTXO snapshot " + fs::PathToString(path));
-    }
-    CBlockIndex* new_tip{WITH_LOCK(::cs_main, return chainman.ActiveTip())};
-
-    UniValue result(UniValue::VOBJ);
-    result.pushKV("coins_loaded", metadata.m_coins_count);
-    result.pushKV("tip_hash", new_tip->GetBlockHash().ToString());
-    result.pushKV("base_height", new_tip->nHeight);
-    result.pushKV("path", fs::PathToString(path));
-    return result;
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("hash_last_main_block", bmmCache.GetLastMainBlockHash().ToString());
+    obj.pushKV("bmm_block_created", hashCreated.ToString());
+    obj.pushKV("bmm_block_submitted", hashConnected.ToString());
+    obj.pushKV("bmm_block_submitted_blind", hashConnectedBlind.ToString());
+    obj.pushKV("ntxn", ntxn);
+    obj.pushKV("nfees", nFees);
+    obj.pushKV("txid", txid.ToString());
+    obj.pushKV("error", strError);
+    return obj;
 },
     };
 }
@@ -2870,6 +2772,99 @@ return RPCHelpMan{
 }
 
 
+static RPCHelpMan formatdepositaddress()
+{
+    return RPCHelpMan{"formatdepositaddress",
+        "Refresh automated BMM. Basic testing implementation.\n",
+        {
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The destination to be formatted as a deposit address."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR, "deposit_address", ""},
+            }},
+        RPCExamples{
+            HelpExampleCli("formatdepositaddress", "")
+            + HelpExampleRpc("formatdepositaddress", "")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::string strAddress = request.params[0].get_str();
+    if (strAddress.empty())
+        throw JSONRPCError(RPC_MISC_ERROR, "Input is blank!");
+
+    std::string strDepositAddress = GenerateDepositAddress(strAddress);
+    std::string strAddressOut = "";
+    unsigned int nSidechainOut;
+    if (!ParseDepositAddress(strDepositAddress, strAddressOut, nSidechainOut))
+        throw JSONRPCError(RPC_MISC_ERROR, "Failed to verify deposit address!");
+
+    return strDepositAddress;
+},
+    };
+}
+
+static RPCHelpMan createwithdrawaldata()
+{
+    return RPCHelpMan{"createwithdrawaldata",
+        "Create withdrawal data script.\n",
+        {
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "."},
+            {"refundaddress", RPCArg::Type::STR, RPCArg::Optional::NO, "."},
+            {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "."},
+            {"mainchainfee", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "script", ""},
+            }},
+        RPCExamples{
+            HelpExampleCli("createwithdrawaldata", "")
+            + HelpExampleRpc("createwithdrawaldata", "")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+
+    CTxDestination dest = DecodeDestination(request.params[0].get_str());
+    if (!IsValidDestination(dest)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address");
+    }
+
+    CTxDestination refundDest = DecodeDestination(request.params[1].get_str());
+    if (!IsValidDestination(refundDest)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid refund address");
+    }
+
+    // Amount
+    CAmount nAmount = AmountFromValue(request.params[2]);
+    if (nAmount <= 0)
+        throw JSONRPCError(RPC_TYPE_ERROR, "Invalid amount for send");
+
+    // Mainchain fee
+    CAmount nMainchainFee = AmountFromValue(request.params[3]);
+    if (nMainchainFee <= 0)
+        throw JSONRPCError(RPC_TYPE_ERROR, "Invalid amount for mainchain fee");
+
+    SidechainWithdrawal wt;
+    wt.nSidechain = THIS_SIDECHAIN;
+    wt.strDestination = request.params[0].get_str();
+    wt.strRefundDestination = request.params[1].get_str();
+    wt.amount = nAmount + nMainchainFee;
+    // TODO this should be the blind withdrawal txid to prevent duplicate
+    // withdrawal object hashes. Using a random hash because of problems
+    // accessing the transaction created by the wallet.
+    wt.hashBlindTx = GetRandHash();
+    wt.mainchainFee = nMainchainFee;
+
+    CScript script = wt.GetScript();
+
+    return HexStr(script);
+},
+    };
+}
+
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -2883,13 +2878,11 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getblockhash},
         {"blockchain", &getblockheader},
         {"blockchain", &getchaintips},
-        {"blockchain", &getdifficulty},
         {"blockchain", &getdeploymentinfo},
         {"blockchain", &gettxout},
         {"blockchain", &gettxoutsetinfo},
         {"blockchain", &pruneblockchain},
         {"blockchain", &verifychain},
-        {"blockchain", &preciousblock},
         {"blockchain", &scantxoutset},
         {"blockchain", &scanblocks},
         {"blockchain", &getblockfilter},
@@ -2902,6 +2895,20 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"hidden", &waitforblock},
         {"hidden", &waitforblockheight},
         {"hidden", &syncwithvalidationinterfacequeue},
+        {"hidden", &dumptxoutset},
+        /* Sidechain RPC non-wallet functions */
+        {"sidechain", &refreshbmm},
+//        {"sidechain", &getaveragemainchainfees},
+//        {"sidechain", &getmainchainblockhash},
+//        {"sidechain", &getmainchainblockcount},
+//        {"sidechain", &getwithdrawalbundle},
+//        {"sidechain", &verifymainblockcache},
+//        {"sidechain", &updatemainblockcache},
+//        {"sidechain", &listmywithdrawals},
+//        {"sidechain", &rebroadcastwithdrawalbundle},
+//        {"sidechain", &getwithdrawal},
+        {"sidechain", &formatdepositaddress},
+        {"sidechain", &createwithdrawaldata},
     };
     for (const auto& c : commands) {
         t.appendCommand(c.name, &c);

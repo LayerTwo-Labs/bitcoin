@@ -413,6 +413,9 @@ private:
      */
     std::set<uint256> m_unbroadcast_txids GUARDED_BY(cs);
 
+    // In mempool withdrawal refund IDs - keep track of them so we don't accept multiple
+    // refunds for the same withdrawal into the mempool.
+    std::set<uint256> setWithdrawalRefund;
 
     /**
      * Helper function to calculate all in-mempool ancestors of staged_ancestors and apply ancestor
@@ -656,6 +659,12 @@ public:
      * of whether the attempt was successful or not)
      */
     void SetLoadTried(bool load_tried);
+
+    bool WithdrawalRefundExists(const uint256& wtid) const
+    {
+        LOCK(cs);
+        return setWithdrawalRefund.count(wtid);
+    }
 
     unsigned long size() const
     {

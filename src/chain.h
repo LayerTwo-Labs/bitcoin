@@ -6,7 +6,6 @@
 #ifndef BITCOIN_CHAIN_H
 #define BITCOIN_CHAIN_H
 
-#include <arith_uint256.h>
 #include <consensus/params.h>
 #include <flatfile.h>
 #include <kernel/cs_main.h>
@@ -165,9 +164,6 @@ public:
     //! Byte offset within rev?????.dat where this block's undo data is stored
     unsigned int nUndoPos GUARDED_BY(::cs_main){0};
 
-    //! (memory only) Total amount of work (expected number of hashes) in the chain up to and including this block
-    arith_uint256 nChainWork{};
-
     //! Number of transactions in this block.
     //! Note: in a potential headers-first mode, this number cannot be relied upon
     //! Note: this value is faked during UTXO snapshot load to ensure that
@@ -197,8 +193,10 @@ public:
     int32_t nVersion{0};
     uint256 hashMerkleRoot{};
     uint32_t nTime{0};
-    uint32_t nBits{0};
-    uint32_t nNonce{0};
+
+    //! BMM
+    uint256 hashWithdrawalBundle;
+    uint256 hashMainchainBlock;
 
     //! (memory only) Sequential id assigned to distinguish order in which blocks are received.
     int32_t nSequenceId{0};
@@ -210,8 +208,8 @@ public:
         : nVersion{block.nVersion},
           hashMerkleRoot{block.hashMerkleRoot},
           nTime{block.nTime},
-          nBits{block.nBits},
-          nNonce{block.nNonce}
+          hashWithdrawalBundle{block.hashWithdrawalBundle},
+          hashMainchainBlock{block.hashMainchainBlock}
     {
     }
 
@@ -245,8 +243,8 @@ public:
             block.hashPrevBlock = pprev->GetBlockHash();
         block.hashMerkleRoot = hashMerkleRoot;
         block.nTime = nTime;
-        block.nBits = nBits;
-        block.nNonce = nNonce;
+        block.hashWithdrawalBundle = hashWithdrawalBundle;
+        block.hashMainchainBlock = hashMainchainBlock;
         return block;
     }
 
@@ -368,9 +366,6 @@ protected:
     CBlockIndex& operator=(CBlockIndex&&) = delete;
 };
 
-arith_uint256 GetBlockProof(const CBlockIndex& block);
-/** Return the time it would take to redo the work difference between from and to, assuming the current hashrate corresponds to the difficulty at tip, in seconds. */
-int64_t GetBlockProofEquivalentTime(const CBlockIndex& to, const CBlockIndex& from, const CBlockIndex& tip, const Consensus::Params&);
 /** Find the forking point between two chain tips. */
 const CBlockIndex* LastCommonAncestor(const CBlockIndex* pa, const CBlockIndex* pb);
 
@@ -417,8 +412,8 @@ public:
         READWRITE(obj.hashPrev);
         READWRITE(obj.hashMerkleRoot);
         READWRITE(obj.nTime);
-        READWRITE(obj.nBits);
-        READWRITE(obj.nNonce);
+        READWRITE(obj.hashWithdrawalBundle);
+        READWRITE(obj.hashMainchainBlock);
     }
 
     uint256 ConstructBlockHash() const
@@ -428,8 +423,8 @@ public:
         block.hashPrevBlock = hashPrev;
         block.hashMerkleRoot = hashMerkleRoot;
         block.nTime = nTime;
-        block.nBits = nBits;
-        block.nNonce = nNonce;
+        block.hashWithdrawalBundle = hashWithdrawalBundle;
+        block.hashMainchainBlock = hashMainchainBlock;
         return block.GetHash();
     }
 

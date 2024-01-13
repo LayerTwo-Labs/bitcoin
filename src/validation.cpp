@@ -9,7 +9,7 @@
 #include <kernel/coinstats.h>
 #include <kernel/mempool_persist.h>
 
-#include <arith_uint256.h>
+#include <bmmcache.h>
 #include <chain.h>
 #include <checkqueue.h>
 #include <clientversion.h>
@@ -19,9 +19,11 @@
 #include <consensus/tx_check.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
+#include <core_io.h>
 #include <cuckoocache.h>
 #include <flatfile.h>
 #include <hash.h>
+#include <key_io.h>
 #include <kernel/chainparams.h>
 #include <kernel/disconnected_transactions.h>
 #include <kernel/mempool_entry.h>
@@ -30,17 +32,20 @@
 #include <logging.h>
 #include <logging/timer.h>
 #include <node/blockstorage.h>
+#include <node/context.h>
+#include <node/interface_ui.h>
 #include <node/utxo_snapshot.h>
 #include <policy/policy.h>
 #include <policy/rbf.h>
 #include <policy/settings.h>
-#include <pow.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <random.h>
 #include <reverse_iterator.h>
 #include <script/script.h>
 #include <script/sigcache.h>
+#include <shutdown.h>
+#include <sidechainclient.h>
 #include <signet.h>
 #include <tinyformat.h>
 #include <txdb.h>
@@ -84,6 +89,24 @@ using node::CBlockIndexWorkComparator;
 using node::fReindex;
 using node::SnapshotMetadata;
 
+BMMCache bmmCache;
+
+bool fSidechainIndex = true;
+
+const std::string strRefundMessageMagic = "REFUND DhjM9iNapSA 3e243e21\n";
+
+std::mutex mainBlockCacheMutex;
+std::mutex mainBlockCacheReorgMutex;
+
+std::unique_ptr<CSidechainTreeDB> psidechaintree;
+
+const size_t SIDECHAIN_MIN_WITHDRAWAL=1;
+const size_t MAX_WITHDRAWAL_BUNDLE_WEIGHT=(MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR) / 2;
+
+std::map<uint256, CBlockIndex*> mapBlockMainHashIndex;
+
+/** Maximum kilobytes for transactions to store for processing during reorg */
+static const unsigned int MAX_DISCONNECTED_TX_POOL_SIZE = 20000;
 /** Time to wait between writing blocks/block index to disk. */
 static constexpr std::chrono::hours DATABASE_WRITE_INTERVAL{1};
 /** Time to wait between flushing chainstate to disk. */
@@ -838,6 +861,70 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     ws.m_modified_fees = ws.m_base_fees;
     m_pool.ApplyDelta(hash, ws.m_modified_fees);
 
+    // If this is a withdrawal check that it is valid
+    for (const CTxOut& txout : tx.vout) {
+        const CScript& scriptPubKey = txout.scriptPubKey;
+        std::vector<unsigned char> vch;
+        if (!scriptPubKey.IsSidechainObj(vch))
+            continue;
+
+        SidechainObj *obj = ParseSidechainObj(vch);
+        if (!obj)
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "invalid-sidechain-obj-script");
+
+        if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_OP) {
+            SidechainWithdrawal *withdrawal = dynamic_cast<SidechainWithdrawal*>(obj);
+            // Verify that burn output actually exists
+            bool fBurnFound = false;
+            for (const CTxOut& o : tx.vout) {
+                if (o.scriptPubKey.size()
+                        && o.scriptPubKey[0] == OP_RETURN
+                        && o.nValue == withdrawal->amount)
+                {
+                    // Make sure that the burn amount & fee are valid
+                    if (withdrawal->amount > 0 && withdrawal->mainchainFee > 0 && withdrawal->amount > withdrawal->mainchainFee)
+                        fBurnFound = true;
+                }
+            }
+            if (!fBurnFound) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "invalid-withdrawal-missing-or-invalid-burn");
+            }
+        }
+    }
+
+    // If this transaction is a withdrawal refund request, verify it.
+    for (const CTxOut& o : tx.vout) {
+        const CScript& scriptPubKey = o.scriptPubKey;
+        uint256 id;
+        std::vector<unsigned char> vchSig;
+        if (!scriptPubKey.IsWithdrawalRefundRequest(id, vchSig))
+            continue;
+
+        if (id.IsNull()) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "verify-withdrawal-refund-no-script");
+        }
+
+        // Check if a refund for this withdrawal is already in our memory pool
+        if (m_pool.WithdrawalRefundExists(id)) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "refund-already-in-mempool");
+        }
+
+        SidechainWithdrawal withdrawal;
+        if (!VerifyWithdrawalRefundRequest(id, vchSig, withdrawal)) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "verify-withdrawal-refund-invalid");
+        }
+    }
+
+
+    // Keep track of transactions that have a withdrawal refund request script
+    bool fRefund = false;
+    uint256 id;
+    for (const CTxOut& o : tx.vout) {
+        std::vector<unsigned char> vchSig;
+        if (o.scriptPubKey.IsWithdrawalRefundRequest(id, vchSig))
+            fRefund = true;
+    }
+
     // Keep track of transactions that spend a coinbase, which we re-scan
     // during reorgs to ensure COINBASE_MATURITY is still met.
     bool fSpendsCoinbase = false;
@@ -853,7 +940,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // reorg to be marked earlier than any child txs that were already in the mempool.
     const uint64_t entry_sequence = bypass_limits ? 0 : m_pool.GetSequence();
     entry.reset(new CTxMemPoolEntry(ptx, ws.m_base_fees, nAcceptTime, m_active_chainstate.m_chain.Height(), entry_sequence,
-                                    fSpendsCoinbase, nSigOpsCost, lock_points.value()));
+                                    fSpendsCoinbase, fRefund, nSigOpsCost, lock_points.value()));
     ws.m_vsize = entry->GetTxSize();
 
     if (nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST)
@@ -1637,15 +1724,7 @@ PackageMempoolAcceptResult ProcessNewPackage(Chainstate& active_chainstate, CTxM
 
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
 {
-    int halvings = nHeight / consensusParams.nSubsidyHalvingInterval;
-    // Force block reward to zero when right shift is undefined.
-    if (halvings >= 64)
-        return 0;
-
-    CAmount nSubsidy = 50 * COIN;
-    // Subsidy is cut in half every 210,000 blocks which will occur approximately every 4 years.
-    nSubsidy >>= halvings;
-    return nSubsidy;
+    return 0;
 }
 
 CoinsViews::CoinsViews(DBParams db_params, CoinsViewOptions options)
@@ -1746,7 +1825,7 @@ void Chainstate::CheckForkWarningConditions()
         return;
     }
 
-    if (m_chainman.m_best_invalid && m_chainman.m_best_invalid->nChainWork > m_chain.Tip()->nChainWork + (GetBlockProof(*m_chain.Tip()) * 6)) {
+    if (m_chainman.m_best_invalid && m_chainman.m_best_invalid->nHeight > m_chain.Tip()->nHeight + 6) {
         LogPrintf("%s: Warning: Found invalid chain at least ~6 blocks longer than our best chain.\nChain state database corruption likely.\n", __func__);
         SetfLargeWorkInvalidChainFound(true);
     } else {
@@ -1758,20 +1837,20 @@ void Chainstate::CheckForkWarningConditions()
 void Chainstate::InvalidChainFound(CBlockIndex* pindexNew)
 {
     AssertLockHeld(cs_main);
-    if (!m_chainman.m_best_invalid || pindexNew->nChainWork > m_chainman.m_best_invalid->nChainWork) {
+    if (!m_chainman.m_best_invalid || pindexNew->nHeight > m_chainman.m_best_invalid->nHeight) {
         m_chainman.m_best_invalid = pindexNew;
     }
     if (m_chainman.m_best_header != nullptr && m_chainman.m_best_header->GetAncestor(pindexNew->nHeight) == pindexNew) {
         m_chainman.m_best_header = m_chain.Tip();
     }
 
-    LogPrintf("%s: invalid block=%s  height=%d  log2_work=%f  date=%s\n", __func__,
+    LogPrintf("%s: invalid block=%s  height=%d  date=%s\n", __func__,
       pindexNew->GetBlockHash().ToString(), pindexNew->nHeight,
-      log(pindexNew->nChainWork.getdouble())/log(2.0), FormatISO8601DateTime(pindexNew->GetBlockTime()));
+      FormatISO8601DateTime(pindexNew->GetBlockTime()));
     CBlockIndex *tip = m_chain.Tip();
     assert (tip);
-    LogPrintf("%s:  current best=%s  height=%d  log2_work=%f  date=%s\n", __func__,
-      tip->GetBlockHash().ToString(), m_chain.Height(), log(tip->nChainWork.getdouble())/log(2.0),
+    LogPrintf("%s:  current best=%s  height=%d  date=%s\n", __func__,
+      tip->GetBlockHash().ToString(), m_chain.Height(),
       FormatISO8601DateTime(tip->GetBlockTime()));
     CheckForkWarningConditions();
 }
@@ -2017,7 +2096,8 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
         // Check that all outputs are available and match the outputs in the block itself
         // exactly.
         for (size_t o = 0; o < tx.vout.size(); o++) {
-            if (!tx.vout[o].scriptPubKey.IsUnspendable()) {
+            const CScript scriptPubKey = tx.vout[o].scriptPubKey;
+            if (!scriptPubKey.IsUnspendable()) {
                 COutPoint out(hash, o);
                 Coin coin;
                 bool is_spent = view.SpendCoin(out, &coin);
@@ -2025,6 +2105,91 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
                     if (!is_bip30_exception) {
                         fClean = false; // transaction output mismatch
                     }
+                }
+            }
+            // If this output is a withdrawal bundle database entry, reset the
+            // status of withdrawals
+            std::vector<unsigned char> vch;
+            if (scriptPubKey.IsSidechainObj(vch)) {
+                SidechainObj *obj = ParseSidechainObj(vch);
+                if (!obj) {
+                    error("DisconnectBlock(): failure reading sidechain obj");
+                    return DISCONNECT_FAILED;
+                }
+
+                if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP) {
+                    const SidechainWithdrawalBundle *withdrawalBundle = (const SidechainWithdrawalBundle *) obj;
+
+                    std::vector<SidechainWithdrawal> vWithdrawal;
+                    for (const uint256& id : withdrawalBundle->vWithdrawalID) {
+                        SidechainWithdrawal withdrawal;
+
+                        if (!psidechaintree->GetWithdrawal(id, withdrawal)) {
+                            error("DisconnectBlock(): withdrawal of bundle not in ldb");
+                            return DISCONNECT_FAILED;
+                        }
+                        if (withdrawal.status == WITHDRAWAL_UNSPENT) {
+                            error("DisconnectBlock(): withdrawal of bundle has invalid unspent status");
+                            return DISCONNECT_FAILED;
+                        }
+
+                        vWithdrawal.push_back(withdrawal);
+                    }
+
+                    // Update status of withdrawals(s)
+                    for (size_t w = 0; w < vWithdrawal.size(); w++)
+                        vWithdrawal[w].status = WITHDRAWAL_UNSPENT;
+
+                    // Write to ldb
+
+                    if (!psidechaintree->WriteWithdrawalUpdate(vWithdrawal)) {
+                        error("DisconnectBlock(): Failed to write withdrawal update!");
+                        return DISCONNECT_FAILED;
+                    }
+
+                    SidechainWithdrawalBundle withdrawalBundleUpdate = *withdrawalBundle;
+                    withdrawalBundleUpdate.status = WITHDRAWAL_BUNDLE_FAILED;
+                    if (!psidechaintree->WriteWithdrawalBundleUpdate(withdrawalBundleUpdate)) {
+                        error("DisconnectBlock(): Failed to write withdrawal bundle update!");
+                        return DISCONNECT_FAILED;
+                    }
+                }
+            }
+
+            // If this output is a withdrawal bundle status update commit - undo the update
+            uint256 hashWithdrawalBundle;
+            if (scriptPubKey.IsWithdrawalBundleFailCommit(hashWithdrawalBundle) ||
+                    scriptPubKey.IsWithdrawalBundleSpentCommit(hashWithdrawalBundle)) {
+
+                SidechainWithdrawalBundle withdrawalBundle;
+                if (!psidechaintree->GetWithdrawalBundle(hashWithdrawalBundle, withdrawalBundle)) {
+                    error("DisconnectBlock(): Failed to read withdrawal bundle to undo update!");
+                    return DISCONNECT_FAILED;
+                }
+
+                withdrawalBundle.status = WITHDRAWAL_BUNDLE_CREATED;
+                withdrawalBundle.nFailHeight = 0;
+
+                if (!psidechaintree->WriteWithdrawalBundleUpdate(withdrawalBundle)) {
+                    error("DisconnectBlock(): Failed to write withdrawal bundle undo update!");
+                    return DISCONNECT_FAILED;
+                }
+            }
+
+            // If output is a Withdrawal refund request set status back to Withdrawal_UNSPENT
+            uint256 id;
+            std::vector<unsigned char> vchSig;
+            if (scriptPubKey.IsWithdrawalRefundRequest(id, vchSig)) {
+                SidechainWithdrawal withdrawal;
+                if (!psidechaintree->GetWithdrawal(id, withdrawal)) {
+                    error("DisconnectBlock(): Failed to read Withdrawal for refund undo!");
+                    return DISCONNECT_FAILED;
+                }
+
+                withdrawal.status = WITHDRAWAL_UNSPENT;
+                if (!psidechaintree->WriteWithdrawalUpdate(std::vector<SidechainWithdrawal>{ withdrawal })) {
+                    error("DisconnectBlock(): Failed to write Withdrawal refund update!");
+                    return DISCONNECT_FAILED;
                 }
             }
         }
@@ -2046,6 +2211,9 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
             // At this point, all of txundo.vprevout should have been moved out.
         }
     }
+
+    // Revert the current withdrawal bundle hash
+    psidechaintree->WriteLastWithdrawalBundleHash(pindex->pprev->hashWithdrawalBundle);
 
     // move best block pointer to prevout block
     view.SetBestBlock(pindex->pprev->GetBlockHash());
@@ -2146,7 +2314,7 @@ static int64_t num_blocks_total = 0;
  *  Validity checks that depend on the UTXO set are also done; ConnectBlock()
  *  can fail if those validity checks fail (among other reasons). */
 bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
-                               CCoinsViewCache& view, bool fJustCheck)
+                               CCoinsViewCache& view, bool fJustCheck, bool fCheckBMM)
 {
     AssertLockHeld(cs_main);
     assert(pindex);
@@ -2171,7 +2339,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // is enforced in ContextualCheckBlockHeader(); we wouldn't want to
     // re-enforce that rule here (at least until we make it impossible for
     // m_adjusted_time_callback() to go backward).
-    if (!CheckBlock(block, state, params.GetConsensus(), !fJustCheck, !fJustCheck)) {
+    if (!CheckBlock(block, state, params.GetConsensus(), !fJustCheck, fCheckBMM)) {
         if (state.GetResult() == BlockValidationResult::BLOCK_MUTATED) {
             // We don't write down blocks to disk if they may have been
             // corrupted, so this should be impossible unless we're having hardware
@@ -2205,8 +2373,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         BlockMap::const_iterator it{m_blockman.m_block_index.find(m_chainman.AssumedValidBlock())};
         if (it != m_blockman.m_block_index.end()) {
             if (it->second.GetAncestor(pindex->nHeight) == pindex &&
-                m_chainman.m_best_header->GetAncestor(pindex->nHeight) == pindex &&
-                m_chainman.m_best_header->nChainWork >= m_chainman.MinimumChainWork()) {
+                m_chainman.m_best_header->GetAncestor(pindex->nHeight) == pindex) {
                 // This block is a member of the assumed verified chain and an ancestor of the best header.
                 // Script verification is skipped when connecting blocks under the
                 // assumevalid block. Assuming the assumevalid block is valid this
@@ -2221,7 +2388,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 //  artificially set the default assumed verified block further back.
                 // The test against the minimum chain work prevents the skipping when denied access to any chain at
                 //  least as good as the expected chain.
-                fScriptChecks = (GetBlockProofEquivalentTime(*m_chainman.m_best_header, *pindex, *m_chainman.m_best_header, params.GetConsensus()) <= 60 * 60 * 24 * 7 * 2);
+                fScriptChecks = true;
             }
         }
     }
@@ -2350,11 +2517,51 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     int nInputs = 0;
     int64_t nSigOpsCost = 0;
     blockundo.vtxundo.reserve(block.vtx.size() - 1);
+    CAmount nDepositPayout = 0;
+    CAmount nRefundPayout = 0;
+    std::multimap<std::pair<CScript, CAmount>, uint256> mapRefundOutputs;
+    std::vector<SidechainWithdrawal> vRefundedWithdrawal;
+    std::set<uint256> setRefundWithdrawalID;
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
         const CTransaction &tx = *(block.vtx[i]);
 
         nInputs += tx.vin.size();
+
+        // Find & verify refund request txns - verify coinbase payouts later
+        for (const CTxOut& o : tx.vout) {
+            const CScript& scriptPubKey = o.scriptPubKey;
+            uint256 id;
+            std::vector<unsigned char> vchSig;
+            if (!scriptPubKey.IsWithdrawalRefundRequest(id, vchSig))
+               continue;
+
+            if (id.IsNull())
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "verify-withdrawal-refund-no-script");
+
+            SidechainWithdrawal withdrawal;
+            if (!VerifyWithdrawalRefundRequest(id, vchSig, withdrawal)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "verify-withdrawal-refund-invalid");
+            }
+
+            if (setRefundWithdrawalID.count(id)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "verify-withdrawal-refund-duplicate");
+            }
+            setRefundWithdrawalID.insert(id);
+
+            // Keep track of refund request outputs so that we can verify they
+            // each have a matching coinbase payout output later.
+            CScript scriptDest = GetScriptForDestination(DecodeDestination(withdrawal.strRefundDestination));
+            mapRefundOutputs.insert(std::pair<std::pair<CScript, CAmount>, uint256>( std::make_pair(scriptDest, withdrawal.amount), id));
+
+            // Update withdrawal object status and keep track of it so that we can apply
+            // the update later if all verification checks work out.
+            withdrawal.status = WITHDRAWAL_SPENT;
+            vRefundedWithdrawal.push_back(withdrawal);
+
+            // Keep track of the total refunded Withdrawal amount for the block
+            nRefundPayout += withdrawal.amount;
+        }
 
         if (!tx.IsCoinBase())
         {
@@ -2383,6 +2590,101 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             if (!SequenceLocks(tx, nLockTimeFlags, prevheights, *pindex)) {
                 LogPrintf("ERROR: %s: contains a non-BIP68-final transaction\n", __func__);
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-nonfinal");
+            }
+        }
+
+        // Count deposit output amounts and collect deposits
+        std::vector<SidechainDeposit> vDeposit;
+        if (tx.IsCoinBase()) {
+            for (const CTxOut& out : tx.vout) {
+                const CScript& scriptPubKey = out.scriptPubKey;
+
+                std::vector<unsigned char> vch;
+                if (!scriptPubKey.IsSidechainObj(vch))
+                    continue;
+
+                SidechainObj *obj = ParseSidechainObj(vch);
+                if (!obj) {
+                    return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "invalid-sidechain-obj-script");
+                }
+
+                if (obj->sidechainop != DB_SIDECHAIN_DEPOSIT_OP)
+                    continue;
+
+                const SidechainDeposit *deposit = (const SidechainDeposit *) obj;
+
+                nDepositPayout += deposit->amtUserPayout;
+
+                vDeposit.push_back(SidechainDeposit(deposit));
+
+                delete obj;
+            }
+        }
+
+        // Verify new deposit payouts
+        //
+        // - Find the previous deposit CTIP (input for first new deposit)
+        //
+        // - Re-calculate the deposit payouts ourselves
+        //
+        // - Loop through all of the rest of the deposits, recalculating
+        // and verifying their deposit payout amounts
+        //
+        // - Check for a coinbase payout output matching each deposit
+        //
+        if (fCheckBMM && vDeposit.size()) {
+            SidechainDeposit prev;
+            bool fHaveDeposits = psidechaintree->GetLastDeposit(prev);
+
+            CAmount amountPrev = CAmount(0);
+            if (fHaveDeposits) {
+                // First deposit should be spending current CTIP, find the
+                // current CTIP in the deposit's inputs
+                bool fFound = false;
+                for (const CTxIn& in : vDeposit.front().dtx.vin) {
+                    if (in.prevout.hash == prev.dtx.GetHash() &&
+                            prev.dtx.vout.size() > in.prevout.n &&
+                            prev.nBurnIndex == in.prevout.n) {
+                        fFound = true;
+                        break;
+                    }
+                }
+                if (!fFound) {
+                    return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "invalid-deposit-input");
+                }
+                // Copy the burn amount from CTIP
+                amountPrev = prev.dtx.vout[prev.nBurnIndex].nValue;
+            }
+
+            // Check deposit payout amounts & find coinbase output
+            for (const SidechainDeposit& d : vDeposit) {
+
+                CAmount burn = d.dtx.vout[d.nBurnIndex].nValue;
+                CAmount payout = burn - amountPrev;
+
+                amountPrev = burn;
+
+                if (d.amtUserPayout == 0 && d.strDest == SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST)
+                    continue;
+
+                if (d.amtUserPayout != payout) {
+                    return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "invalid-deposit-amount");
+                }
+
+                // Now check coinbase outputs
+                bool fFound = false;
+                for (const CTxOut& o : block.vtx[0]->vout) {
+                    if (o.nValue == d.amtUserPayout - SIDECHAIN_DEPOSIT_FEE &&
+                            o.scriptPubKey == GetScriptForDestination(
+                                DecodeDestination(d.strDest)))
+                    {
+                        fFound = true;
+                        break;
+                    }
+                }
+                if (!fFound) {
+                    return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "invalid-deposit-missing-output");
+                }
             }
         }
 
@@ -2425,10 +2727,287 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
              Ticks<SecondsDouble>(time_connect),
              Ticks<MillisecondsDouble>(time_connect) / num_blocks_total);
 
-    CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, params.GetConsensus());
+    // Verify Withdrawal refunds
+    // - Check that for every Withdrawal refund request tx in the block a refund payout
+    // of the correct amount to the Withdrawal refund address exists in the coinbase tx.
+    //
+    // - Check that no refund payout outputs exist that aren't based on a valid
+    // refund request tx. This is checked by making sure that the coinbase total
+    // out amount is nFees + nDepositPayout + nRefundPayout. Any extra outputs
+    // will make the block invalid.
+    //
+    // Loop through the refund outputs in the multimap. For each key, get the
+    // range of values with the same key (the refund destination script).
+    // Make sure that the correct number of coinbase payout outputs exist for
+    // each bucket of keys.
+    for (auto it = mapRefundOutputs.begin(); it != mapRefundOutputs.end();)
+    {
+        // Get range of outputs with this CTxDestination
+        std::pair<std::multimap<std::pair<CScript, CAmount>, uint256>::iterator, std::multimap<std::pair<CScript, CAmount>, uint256>::iterator> range;
+        range = mapRefundOutputs.equal_range(it->first);
+
+        // Count outputs that match items in the range
+        int nOut = std::distance(range.first, range.second);
+        int nFound = 0;
+        for (const CTxOut& o : block.vtx[0]->vout) {
+            if (o.scriptPubKey == it->first.first && o.nValue == it->first.second) {
+                nFound++;
+
+                // If we aren't looking for multiple outputs, stop now
+                if (nOut == 1) {
+                    break;
+                }
+            }
+        }
+
+        if (nFound != nOut)
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "verify-withdrawal-refund-missing-payout");
+
+        // Move on to end of range
+        it = range.second;
+    }
+
+    // Update status of refunded Withdrawal(s)
+    if (!fJustCheck && vRefundedWithdrawal.size()) {
+        // Write the updated status of withdrawals(s) in the bundle (WITHDRAW_SPENT)
+        if (!psidechaintree->WriteWithdrawalUpdate(vRefundedWithdrawal))
+            return state.Error(strprintf("%s: Failed to write refunded withdrawal status update!\n", __func__));
+    }
+
+    CAmount blockReward = nFees + nDepositPayout + nRefundPayout;
+
     if (block.vtx[0]->GetValueOut() > blockReward) {
         LogPrintf("ERROR: ConnectBlock(): coinbase pays too much (actual=%d vs limit=%d)\n", block.vtx[0]->GetValueOut(), blockReward);
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount");
+    }
+
+    if (fJustCheck)
+        return true;
+
+    if (fSidechainIndex) {
+        SidechainClient client;
+
+        // Send latest bundle to the mainchain if it hasn't been broadcasted yet
+        SidechainWithdrawalBundle withdrawalBundleLatest;
+        uint256 hashLatestWithdrawalBundle;
+        psidechaintree->GetLastWithdrawalBundleHash(hashLatestWithdrawalBundle);
+        if (psidechaintree->GetWithdrawalBundle(hashLatestWithdrawalBundle, withdrawalBundleLatest)) {
+            // If we haven't broadcasted the latest bundle yet, do it now
+            if (!bmmCache.HaveBroadcastedWithdrawalBundle(hashLatestWithdrawalBundle)) {
+                std::string strHex = EncodeHexTx(CTransaction(withdrawalBundleLatest.tx));
+                if (client.BroadcastWithdrawalBundle(strHex)) {
+                    bmmCache.StoreBroadcastedWithdrawalBundle(hashLatestWithdrawalBundle);
+                }
+            }
+        } else {
+            LogPrintf("%s: Failed to get latest withdrawal bundle from ldb: %s!\n", __func__, hashLatestWithdrawalBundle.ToString());
+        }
+
+        // Check version commit in coinbase
+        bool fVersionCommitFound = false;
+        for (const CTxOut& out : block.vtx[0]->vout) {
+            int32_t nVersion;
+            if (out.scriptPubKey.IsBlockVersionCommit(nVersion)) {
+                if (block.nVersion != nVersion) {
+                    LogPrintf("%s: Invalid block version commit.\n", __func__);
+                    return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "invalid version commit");
+                }
+                fVersionCommitFound = true;
+                break;
+            }
+        }
+        if (!fVersionCommitFound) {
+            LogPrintf("%s: Missing block version commit!\n", __func__);
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "Block version commit not found!");
+        }
+
+        // Check current bundle hash in header and coinbase
+        if (!hashLatestWithdrawalBundle.IsNull()) {
+            bool fWithdrawalBundleCommitFound = false;
+            for (const CTxOut& out : block.vtx[0]->vout) {
+                uint256 hashWithdrawalBundle;
+                if (out.scriptPubKey.IsWithdrawalBundleHashCommit(hashWithdrawalBundle)) {
+                    if (hashWithdrawalBundle != hashLatestWithdrawalBundle) {
+                        LogPrintf("%s: Invalid withdrawal bundle hash commit: %s != %s\n", __func__, hashLatestWithdrawalBundle.ToString(), hashWithdrawalBundle.ToString());
+                        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "invalid withdrawal bundle hash commit");
+                    }
+                    fWithdrawalBundleCommitFound = true;
+                    break;
+                }
+            }
+            if (!fWithdrawalBundleCommitFound) {
+                LogPrintf("%s: Missing Withdrawal Bundle hash commit!\n", __func__);
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "Withdrawal Bundle hash commit not found!");
+            }
+
+            if (block.hashWithdrawalBundle != hashLatestWithdrawalBundle) {
+                LogPrintf("%s: Invalid Withdrawal Bundle hash in block header!\n", __func__);
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "Withdrawal Bundle hash in header is invalid!");
+            }
+        }
+        // Check for & validate Withdrawal Bundle status updates
+        for (const CTxOut& txout : block.vtx[0]->vout) {
+            const CScript& scriptPubKey = txout.scriptPubKey;
+
+            uint256 hashWithdrawalBundle;
+            bool fFailCommit = scriptPubKey.IsWithdrawalBundleFailCommit(hashWithdrawalBundle);
+
+            if (fFailCommit || scriptPubKey.IsWithdrawalBundleSpentCommit(hashWithdrawalBundle)) {
+                // Verify with the mainchain when we are also checking BMM
+                if (fCheckBMM) {
+                    bool fVerified = fFailCommit ?
+                        client.HaveFailedWithdrawalBundle(hashWithdrawalBundle) :
+                        client.HaveSpentWithdrawalBundle(hashWithdrawalBundle);
+
+                    if (!fVerified)
+                        return state.Error(strprintf("%s: Invalid Withdrawal Bundle update : %s - %s!\n",
+                                    __func__, fFailCommit ? "Failed" : "Paid out",
+                                    hashWithdrawalBundle.ToString()));
+                }
+
+                // Load the Withdrawal Bundle object from LDB if we need to and then write an
+                // update with the new Withdrawal Bundle status. If the commit is for the
+                // current Withdrawal Bundle (which it always should be in practice) we have
+                // already loaded it.
+                if (hashWithdrawalBundle == withdrawalBundleLatest.tx.GetHash()) {
+                    withdrawalBundleLatest.status = fFailCommit ? WITHDRAWAL_BUNDLE_FAILED : WITHDRAWAL_BUNDLE_SPENT;
+
+                    // Keep track of the height a Withdrawal Bundle was marked failed
+                    if (fFailCommit)
+                        withdrawalBundleLatest.nFailHeight = pindex->nHeight;
+
+                    if (!psidechaintree->WriteWithdrawalBundleUpdate(withdrawalBundleLatest))
+                        return state.Error(strprintf("%s: Failed to write Withdrawal Bundle update!\n", __func__));
+
+                } else {
+                    SidechainWithdrawalBundle withdrawalBundle;
+                    if (!psidechaintree->GetWithdrawalBundle(hashWithdrawalBundle, withdrawalBundle))
+                        return state.Error(strprintf("%s: Failed to read Withdrawal Bundle for update!\n", __func__));
+
+                    withdrawalBundle.status = fFailCommit ? WITHDRAWAL_BUNDLE_FAILED : WITHDRAWAL_BUNDLE_SPENT;
+
+                    // Keep track of the height a Withdrawal Bundle was marked failed
+                    if (fFailCommit)
+                        withdrawalBundleLatest.nFailHeight = pindex->nHeight;
+
+                    if (!psidechaintree->WriteWithdrawalBundleUpdate(withdrawalBundle))
+                        return state.Error(strprintf("%s: Failed to write Withdrawal Bundle update!\n", __func__));
+                }
+            }
+        }
+
+        // Collect & verify sidechain objects
+        std::vector<std::pair<uint256, const SidechainObj *> > vSidechainObjects;
+        bool fFoundWithdrawalBundle = false;
+        for (const CTransactionRef& tx : block.vtx) {
+            for (const CTxOut& txout : tx->vout) {
+                const CScript& scriptPubKey = txout.scriptPubKey;
+
+                std::vector<unsigned char> vch;
+                if (!scriptPubKey.IsSidechainObj(vch))
+                    continue;
+
+                SidechainObj *obj = ParseSidechainObj(vch);
+                if (!obj)
+                    return state.Error("Invalid sidechain obj script");
+
+                // TODO
+                // Refactor. We are also loading SidechainWithdrawal later when
+                // calculating the ID. Instead do it only once.
+
+                // Check validity of withdrawals.
+                if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_OP) {
+                    const SidechainWithdrawal *withdrawal = (const SidechainWithdrawal *) obj;
+                    // Verify that burn output actually exists
+                    bool fBurnFound = false;
+                    // TODO refactor: looping through vout again during a loop
+                    // through vout... could be more efficient
+                    for (const CTxOut& o : tx->vout) {
+                        if (o.scriptPubKey.size()
+                                && o.scriptPubKey[0] == OP_RETURN
+                                && o.nValue == withdrawal->amount)
+                        {
+                            // Make sure that the burn amount & fee are valid
+                            if (withdrawal->amount > 0 && withdrawal->mainchainFee > 0
+                                    && withdrawal->amount > withdrawal->mainchainFee)
+                                fBurnFound = true;
+                        }
+                    }
+                    if (!fBurnFound) {
+                        return state.Error("Invalid Withdrawal: invalid-withdrawal-missing-or-invalid-burn");
+                    }
+                }
+
+                // If the object is a withdrawal we do not want the ID to change when
+                // the withdrawal status is changed so that we can update the status
+                // using the same ID in ldb.
+                uint256 id;
+                if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_OP) {
+                    const SidechainWithdrawal *withdrawal = (const SidechainWithdrawal *) obj;
+                    id = withdrawal->GetID();
+                }
+                else
+                if (obj->sidechainop == DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP) {
+                    // A block is invalid if it adds a new Withdrawal Bundle when the current
+                    // Withdrawal Bundle status hasn't been updated to either WITHDRAWAL_BUNDLE_FAILED
+                    // or WITHDRAWAL_BUNDLE_SPENT
+                    if (!hashLatestWithdrawalBundle.IsNull()) {
+                        if (withdrawalBundleLatest.status == WITHDRAWAL_BUNDLE_CREATED) {
+                            return state.Error(strprintf("%s Invalid Withdrawal Bundle - current Withdrawal Bundle still pending!\n", __func__));
+                        }
+                    }
+
+                    // If we find a Withdrawal Bundle we will call VerifyWithdrawalBundles later
+                    fFoundWithdrawalBundle = true;
+
+                    SidechainWithdrawalBundle *withdrawalBundle = (SidechainWithdrawalBundle *) obj;
+
+                    // Insert block height
+                    withdrawalBundle->nHeight = pindex->nHeight;
+
+                    id = withdrawalBundle->GetID();
+                    obj = (SidechainObj *) withdrawalBundle;
+
+                    LogPrintf("%s: Found new Withdrawal Bundle: %s.\n", __func__, withdrawalBundle->tx.GetHash().ToString());
+                }
+                else
+                if (obj->sidechainop == DB_SIDECHAIN_DEPOSIT_OP) {
+                    const SidechainDeposit *deposit = (const SidechainDeposit *) obj;
+                    id = deposit->GetID();
+                }
+                vSidechainObjects.push_back(std::make_pair(id, obj));
+            }
+        }
+
+        // Handle Withdrawal Bundle verification & withdrawal status update
+        if (fFoundWithdrawalBundle) {
+            std::string strFail = "";
+            std::vector<SidechainWithdrawal> vWithdrawal;
+            uint256 hashWithdrawalBundle;
+            uint256 hashWithdrawalBundleID;
+
+            // This will also return a list of withdrawal(s) from the Withdrawal Bundle
+            if (!VerifyWithdrawalBundles(strFail, pindex->nHeight, block.vtx, vWithdrawal, hashWithdrawalBundle, hashWithdrawalBundleID, fCheckBMM /* fReplicate */))
+                return state.Error(strprintf("%s: Invalid Withdrawal Bundle! Error: %s", __func__, strFail));
+
+            if (hashWithdrawalBundle.IsNull())
+                return state.Error(strprintf("%s: hashWithdrawalBundle shouldn't be null if VerifyWithdrawalBundles passed!\n", __func__));
+
+            // Write the updated status of withdrawals in the Withdrawal Bundle (Withdrawal_IN_WITHDRAWAL_BUNDLE)
+            if (!psidechaintree->WriteWithdrawalUpdate(vWithdrawal))
+                return state.Error(strprintf("%s: Failed to write withdrawal update!\n", __func__));
+        }
+
+        // Write sidechain objects to db
+        if (vSidechainObjects.size()) {
+            bool ret = psidechaintree->WriteSidechainIndex(vSidechainObjects);
+            if (!ret)
+                return state.Error("Failed to write sidechain index!");
+
+            // Cleanup
+            for (size_t i = 0; i < vSidechainObjects.size(); i++)
+                delete vSidechainObjects[i].second;
+        }
     }
 
     if (!control.Wait()) {
@@ -2443,10 +3022,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
              Ticks<SecondsDouble>(time_verify),
              Ticks<MillisecondsDouble>(time_verify) / num_blocks_total);
 
-    if (fJustCheck)
-        return true;
-
-    if (!m_blockman.WriteUndoDataForBlock(blockundo, state, *pindex)) {
+    if (!m_blockman.WriteUndoDataForBlock(blockundo, state, pindex, params)) {
         return false;
     }
 
@@ -2698,10 +3274,10 @@ static void UpdateTipLog(
 {
 
     AssertLockHeld(::cs_main);
-    LogPrintf("%s%s: new best=%s height=%d version=0x%08x log2_work=%f tx=%lu date='%s' progress=%f cache=%.1fMiB(%utxo)%s\n",
+    LogPrintf("%s%s: new best=%s height=%d version=0x%08x tx=%lu date='%s' progress=%f cache=%.1fMiB(%utxo)%s\n",
         prefix, func_name,
         tip->GetBlockHash().ToString(), tip->nHeight, tip->nVersion,
-        log(tip->nChainWork.getdouble()) / log(2.0), (unsigned long)tip->nChainTx,
+        (unsigned long)tip->nChainTx,
         FormatISO8601DateTime(tip->GetBlockTime()),
         GuessVerificationProgress(params.TxData(), tip),
         coins_tip.DynamicMemoryUsage() * (1.0 / (1 << 20)),
@@ -3006,7 +3582,7 @@ CBlockIndex* Chainstate::FindMostWorkChain()
             bool fMissingData = !(pindexTest->nStatus & BLOCK_HAVE_DATA);
             if (fFailedChain || fMissingData) {
                 // Candidate chain is not usable (either invalid or missing data)
-                if (fFailedChain && (m_chainman.m_best_invalid == nullptr || pindexNew->nChainWork > m_chainman.m_best_invalid->nChainWork)) {
+                if (fFailedChain && (m_chainman.m_best_invalid == nullptr || pindexNew->nHeight > m_chainman.m_best_invalid->nHeight)) {
                     m_chainman.m_best_invalid = pindexNew;
                 }
                 CBlockIndex *pindexFailed = pindexNew;
@@ -3118,7 +3694,7 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
                 }
             } else {
                 PruneBlockIndexCandidates();
-                if (!pindexOldTip || m_chain.Tip()->nChainWork > pindexOldTip->nChainWork) {
+                if (!pindexOldTip || m_chain.Tip()->nHeight > pindexOldTip->nHeight) {
                     // We're in a better position than we were. Return temporarily to release the lock.
                     fContinue = false;
                     break;
@@ -3329,37 +3905,6 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
     return true;
 }
 
-bool Chainstate::PreciousBlock(BlockValidationState& state, CBlockIndex* pindex)
-{
-    AssertLockNotHeld(m_chainstate_mutex);
-    AssertLockNotHeld(::cs_main);
-    {
-        LOCK(cs_main);
-        if (pindex->nChainWork < m_chain.Tip()->nChainWork) {
-            // Nothing to do, this block is not at the tip.
-            return true;
-        }
-        if (m_chain.Tip()->nChainWork > m_chainman.nLastPreciousChainwork) {
-            // The chain has been extended since the last call, reset the counter.
-            m_chainman.nBlockReverseSequenceId = -1;
-        }
-        m_chainman.nLastPreciousChainwork = m_chain.Tip()->nChainWork;
-        setBlockIndexCandidates.erase(pindex);
-        pindex->nSequenceId = m_chainman.nBlockReverseSequenceId;
-        if (m_chainman.nBlockReverseSequenceId > std::numeric_limits<int32_t>::min()) {
-            // We can't keep reducing the counter if somebody really wants to
-            // call preciousblock 2**31-1 times on the same set of tips...
-            m_chainman.nBlockReverseSequenceId--;
-        }
-        if (pindex->IsValid(BLOCK_VALID_TRANSACTIONS) && pindex->HaveNumChainTxs()) {
-            setBlockIndexCandidates.insert(pindex);
-            PruneBlockIndexCandidates();
-        }
-    }
-
-    return ActivateBestChain(state, std::shared_ptr<const CBlock>());
-}
-
 bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pindex)
 {
     AssertLockNotHeld(m_chainstate_mutex);
@@ -3399,8 +3944,8 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
             if (!m_chain.Contains(candidate) &&
                     !CBlockIndexWorkComparator()(candidate, pindex->pprev) &&
                     candidate->IsValid(BLOCK_VALID_TRANSACTIONS) &&
-                    candidate->HaveNumChainTxs()) {
-                candidate_blocks_by_work.insert(std::make_pair(candidate->nChainWork, candidate));
+                    candidate->HaveTxsDownloaded()) {
+                candidate_blocks_by_work.insert(std::make_pair(candidate->nHeight, candidate));
             }
         }
     }
@@ -3450,7 +3995,7 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
         }
 
         // Add any equal or more work headers to setBlockIndexCandidates
-        auto candidate_it = candidate_blocks_by_work.lower_bound(invalid_walk_tip->pprev->nChainWork);
+        auto candidate_it = candidate_blocks_by_work.lower_bound(invalid_walk_tip->pprev->nHeight);
         while (candidate_it != candidate_blocks_by_work.end()) {
             if (!CBlockIndexWorkComparator()(candidate_it->second, invalid_walk_tip->pprev)) {
                 setBlockIndexCandidates.insert(candidate_it->second);
@@ -3612,31 +4157,20 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
     }
 }
 
-static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true)
-{
-    // Check proof of work matches claimed amount
-    if (fCheckPOW && !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
-        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
-
-    return true;
-}
-
-bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW, bool fCheckMerkleRoot)
+bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckMerkleRoot, bool fCheckBMM)
 {
     // These are checks that are independent of context.
 
+    bool fGenesis = (block.GetHash() == Params().GetConsensus().hashGenesisBlock);
+
+    // Check for mainchain connection
+    if (!fGenesis && fCheckBMM && !CheckMainchainConnection()) {
+        SetNetworkActive(false, "Failed to connect to mainchain when checking block!");
+        return false;
+    }
+
     if (block.fChecked)
         return true;
-
-    // Check that the header is valid (particularly PoW).  This is mostly
-    // redundant with the call in AcceptBlockHeader.
-    if (!CheckBlockHeader(block, state, consensusParams, fCheckPOW))
-        return false;
-
-    // Signet only: check block solution
-    if (consensusParams.signet_blocks && fCheckPOW && !CheckSignetBlockSolution(block, consensusParams)) {
-        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-signet-blksig", "signet block signature validation failure");
-    }
 
     // Check the merkle root.
     if (fCheckMerkleRoot) {
@@ -3669,6 +4203,63 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
         if (block.vtx[i]->IsCoinBase())
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-multiple", "more than one coinbase");
 
+    // Verify BMM with mainchain
+    if (fCheckBMM && !VerifyBMM(block))
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "invalid bmm / failed to verify BMM for block");
+
+    if (!fGenesis && fCheckBMM) {
+        // Check required PrevBlockCommit
+        bool fPrevCommitFound = false;
+        for (const CTxOut& out : block.vtx[0]->vout) {
+            uint256 hashPrevMain;
+            uint256 hashPrevSide;
+            if (out.scriptPubKey.IsPrevBlockCommit(hashPrevMain, hashPrevSide)) {
+                if (hashPrevMain != bmmCache.GetMainPrevBlockHash(block.hashMainchainBlock)) {
+                    LogPrintf("%s: Invalid mainchain prevBlock commit: %s != %s\n", __func__, hashPrevMain.ToString(), bmmCache.GetMainPrevBlockHash(block.hashMainchainBlock).ToString());
+                    return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "Invalid mainchin prevBlock commit");
+                }
+                if (hashPrevSide != block.hashPrevBlock) {
+                    LogPrintf("%s: Invalid sidechain prevBlock commit: %s != %s\n", __func__, hashPrevSide.ToString(), block.hashPrevBlock.ToString());
+                    return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "Invalid sidechain prevBlock commit");
+                }
+                fPrevCommitFound = true;
+                break;
+            }
+        }
+        if (!fPrevCommitFound) {
+            LogPrintf("%s: Missing prevBlock commit!\n", __func__);
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "PrevBlockCommit not found!");
+        }
+    }
+
+    // Find deposits and verify that they exist with mainchain
+    if (fCheckBMM) {
+        for (const CTxOut& out : block.vtx[0]->vout) {
+            const CScript& scriptPubKey = out.scriptPubKey;
+
+            std::vector<unsigned char> vch;
+            if (!scriptPubKey.IsSidechainObj(vch))
+                continue;
+
+            SidechainObj *obj = ParseSidechainObj(vch);
+            if (!obj) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "invalid-sidechain-obj-script");
+            }
+
+            if (obj->sidechainop != DB_SIDECHAIN_DEPOSIT_OP)
+                continue;
+
+            const SidechainDeposit* deposit = (const SidechainDeposit *) obj;
+
+            if (!VerifyDeposit(deposit->hashMainchainBlock, deposit->dtx.GetHash(), deposit->nTx)) {
+                delete obj;
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "invalid-sidechain-deposit");
+            }
+
+            delete obj;
+        }
+    }
+
     // Check transactions
     // Must check for duplicate inputs (see CVE-2018-17144)
     for (const auto& tx : block.vtx) {
@@ -3689,7 +4280,7 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
     if (nSigOps * WITNESS_SCALE_FACTOR > MAX_BLOCK_SIGOPS_COST)
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", "out-of-bounds SigOpCount");
 
-    if (fCheckPOW && fCheckMerkleRoot)
+    if (fCheckBMM && fCheckMerkleRoot)
         block.fChecked = true;
 
     return true;
@@ -3734,22 +4325,6 @@ std::vector<unsigned char> ChainstateManager::GenerateCoinbaseCommitment(CBlock&
     return commitment;
 }
 
-bool HasValidProofOfWork(const std::vector<CBlockHeader>& headers, const Consensus::Params& consensusParams)
-{
-    return std::all_of(headers.cbegin(), headers.cend(),
-            [&](const auto& header) { return CheckProofOfWork(header.GetHash(), header.nBits, consensusParams);});
-}
-
-arith_uint256 CalculateHeadersWork(const std::vector<CBlockHeader>& headers)
-{
-    arith_uint256 total_work{0};
-    for (const CBlockHeader& header : headers) {
-        CBlockIndex dummy(header);
-        total_work += GetBlockProof(dummy);
-    }
-    return total_work;
-}
-
 /** Context-dependent validity checks.
  *  By "context", we mean only the previous block headers, but not the UTXO
  *  set; UTXO-related validity checks are done in ConnectBlock().
@@ -3764,11 +4339,6 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
     AssertLockHeld(::cs_main);
     assert(pindexPrev != nullptr);
     const int nHeight = pindexPrev->nHeight + 1;
-
-    // Check proof of work
-    const Consensus::Params& consensusParams = chainman.GetConsensus();
-    if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
-        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits", "incorrect proof of work");
 
     // Check against checkpoints
     if (chainman.m_options.checkpoints_enabled) {
@@ -3894,10 +4464,18 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
 {
     AssertLockHeld(cs_main);
 
+    bool fGenesis = (block.GetHash() == Params().GetConsensus().hashGenesisBlock);
+
+    // Check for mainchain connection
+    if (!fGenesis && !CheckMainchainConnection()) {
+        SetNetworkActive(false, "Failed to connect to mainchain when checking block header!");
+        return false;
+    }
+
     // Check for duplicate
     uint256 hash = block.GetHash();
     BlockMap::iterator miSelf{m_blockman.m_block_index.find(hash)};
-    if (hash != GetConsensus().hashGenesisBlock) {
+    if (!fGenesis) {
         if (miSelf != m_blockman.m_block_index.end()) {
             // Block header is already known.
             CBlockIndex* pindex = &(miSelf->second);
@@ -3907,12 +4485,10 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
                 LogPrint(BCLog::VALIDATION, "%s: block %s is marked invalid\n", __func__, hash.ToString());
                 return state.Invalid(BlockValidationResult::BLOCK_CACHED_INVALID, "duplicate");
             }
-            return true;
-        }
+            if (!VerifyBMM(block))
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "Invalid BMM in block header!");
 
-        if (!CheckBlockHeader(block, state, GetConsensus())) {
-            LogPrint(BCLog::VALIDATION, "%s: Consensus::CheckBlockHeader: %s, %s\n", __func__, hash.ToString(), state.ToString());
-            return false;
+            return true;
         }
 
         // Get prev block index
@@ -4035,10 +4611,6 @@ void ChainstateManager::ReportHeadersPresync(const arith_uint256& work, int64_t 
     AssertLockNotHeld(cs_main);
     {
         LOCK(cs_main);
-        // Don't report headers presync progress if we already have a post-minchainwork header chain.
-        // This means we lose reporting for potentially legitimate, but unlikely, deep reorgs, but
-        // prevent attackers that spam low-work headers from filling our logs.
-        if (m_best_header->nChainWork >= UintToArith256(GetConsensus().nMinimumChainWork)) return;
         // Rate limit headers presync updates to 4 per second, as these are not subject to DoS
         // protection.
         auto now = std::chrono::steady_clock::now();
@@ -4076,7 +4648,7 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     // measure, unless the blocks have more work than the active chain tip, and
     // aren't too far ahead of it, so are likely to be attached soon.
     bool fAlreadyHave = pindex->nStatus & BLOCK_HAVE_DATA;
-    bool fHasMoreOrSameWork = (ActiveTip() ? pindex->nChainWork >= ActiveTip()->nChainWork : true);
+    bool fHasMoreOrSameWork = (m_chain.Tip() ? pindex->nHeight >= m_chain.Tip()->nHeight : true);
     // Blocks that are too out-of-order needlessly limit the effectiveness of
     // pruning, because pruning will not delete block files that contain any
     // blocks which are too close in height to the tip.  Apply this test
@@ -4097,12 +4669,6 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
         if (pindex->nTx != 0) return true;    // This is a previously-processed block that was pruned
         if (!fHasMoreOrSameWork) return true; // Don't process less-work chains
         if (fTooFarAhead) return true;        // Block height is too high
-
-        // Protect against DoS attacks from low-work chains.
-        // If our tip is behind, a peer could try to send us
-        // low-work blocks on a fake chain that we would never
-        // request; don't process these.
-        if (pindex->nChainWork < MinimumChainWork()) return true;
     }
 
     const CChainParams& params{GetParams()};
@@ -4116,9 +4682,26 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
         return error("%s: %s", __func__, state.ToString());
     }
 
+    bool fInitialBlockDownload = IsInitialBlockDownload();
+
+    bool fVerifyWithdrawalBundleAcceptBlock = gArgs.GetBoolArg("-verifywithdrawalbundleacceptblock", DEFAULT_VERIFY_WITHDRAWAL_BUNDLE_ACCEPT_BLOCK);
+    if (fVerifyWithdrawalBundleAcceptBlock && !fInitialBlockDownload) {
+        // Note that here we call VerifyWithdrawalBundles with fReplicate set so that we
+        // replicate the Withdrawal Bundle on our own and verify that it matches the Withdrawal Bundle in
+        // this new block if there are any.
+       std::string strFail = "";
+        std::vector<SidechainWithdrawal> vWithdrawal;
+        uint256 hashWithdrawalBundle;
+        uint256 hashWithdrawalBundleID;
+        if (!VerifyWithdrawalBundles(strFail, pindex->nHeight, block.vtx, vWithdrawal, hashWithdrawalBundle, hashWithdrawalBundleID, true /* fReplicate */)) {
+            state.Error(strprintf("%s: invalid-withdrawal-bundle error: %s", __func__, strFail));
+            return error("%s: invalid Withdrawal Bundle! Error: %s", __func__, strFail);
+        }
+    }
+
     // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW
     // (but if it does not build on our best tip, let the SendMessages loop relay it)
-    if (!IsInitialBlockDownload() && ActiveTip() == pindex->pprev)
+    if (!fInitialBlockDownload && m_chain.Tip() == pindex->pprev)
         GetMainSignals().NewPoWValidBlock(pindex, pblock);
 
     // Write block to history file
@@ -4151,6 +4734,15 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
 bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool* new_block)
 {
     AssertLockNotHeld(cs_main);
+
+    bool fReorg = false;
+    std::vector<uint256> vOrphan;
+    if (!UpdateMainBlockHashCache(fReorg, vOrphan)) {
+        LogPrintf("%s: Failed to update main block hash cache!\n", __func__);
+        return false;
+    }
+    if (fReorg)
+        HandleMainchainReorg(vOrphan);
 
     {
         CBlockIndex *pindex = nullptr;
@@ -4213,11 +4805,14 @@ bool TestBlockValidity(BlockValidationState& state,
                        const CBlock& block,
                        CBlockIndex* pindexPrev,
                        const std::function<NodeClock::time_point()>& adjusted_time_callback,
-                       bool fCheckPOW,
-                       bool fCheckMerkleRoot)
+                       bool fCheckMerkleRoot,
+                       bool fCheckBMM,
+                       bool fReorg)
 {
     AssertLockHeld(cs_main);
-    assert(pindexPrev && pindexPrev == chainstate.m_chain.Tip());
+    assert(pindexPrev);
+    if (!fReorg)
+        assert(pindexPrev == chainstate.m_chain.Tip());
     CCoinsViewCache viewNew(&chainstate.CoinsTip());
     uint256 block_hash(block.GetHash());
     CBlockIndex indexDummy(block);
@@ -4228,13 +4823,16 @@ bool TestBlockValidity(BlockValidationState& state,
     // NOTE: CheckBlockHeader is called by CheckBlock
     if (!ContextualCheckBlockHeader(block, state, chainstate.m_blockman, chainstate.m_chainman, pindexPrev, adjusted_time_callback()))
         return error("%s: Consensus::ContextualCheckBlockHeader: %s", __func__, state.ToString());
-    if (!CheckBlock(block, state, chainparams.GetConsensus(), fCheckPOW, fCheckMerkleRoot))
+    if (!CheckBlock(block, state, chainparams.GetConsensus(), fCheckMerkleRoot, fCheckBMM))
         return error("%s: Consensus::CheckBlock: %s", __func__, state.ToString());
     if (!ContextualCheckBlock(block, state, chainstate.m_chainman, pindexPrev))
         return error("%s: Consensus::ContextualCheckBlock: %s", __func__, state.ToString());
-    if (!chainstate.ConnectBlock(block, state, &indexDummy, viewNew, true)) {
-        return false;
+
+    if (!fReorg) {
+        if (!chainstate.ConnectBlock(block, state, &indexDummy, viewNew, true, fCheckBMM))
+            return false;
     }
+
     assert(state.IsValid());
 
     return true;
@@ -4344,7 +4942,7 @@ VerifyDBResult CVerifyDB::VerifyDB(
             return VerifyDBResult::CORRUPTED_BLOCK_DB;
         }
         // check level 1: verify block validity
-        if (nCheckLevel >= 1 && !CheckBlock(block, state, consensus_params)) {
+        if (nCheckLevel >= 1 && !CheckBlock(block, state, consensus_params, true /* Check merkle root */, false /* Check BMM */)) {
             LogPrintf("Verification error: found bad block at %d, hash=%s (%s)\n",
                       pindex->nHeight, pindex->GetBlockHash().ToString(), state.ToString());
             return VerifyDBResult::CORRUPTED_BLOCK_DB;
@@ -4409,7 +5007,7 @@ VerifyDBResult CVerifyDB::VerifyDB(
                 LogPrintf("Verification error: ReadBlockFromDisk failed at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
                 return VerifyDBResult::CORRUPTED_BLOCK_DB;
             }
-            if (!chainstate.ConnectBlock(block, state, pindex, coins)) {
+            if (!chainstate.ConnectBlock(block, state, pindex, coins, false /* Just check */, false /* Check BMM */)) {
                 LogPrintf("Verification error: found unconnectable block at %d, hash=%s (%s)\n", pindex->nHeight, pindex->GetBlockHash().ToString(), state.ToString());
                 return VerifyDBResult::CORRUPTED_BLOCK_DB;
             }
@@ -4572,7 +5170,7 @@ bool ChainstateManager::LoadBlockIndex()
                     chainstate->TryAddBlockIndexCandidate(pindex);
                 }
             }
-            if (pindex->nStatus & BLOCK_FAILED_MASK && (!m_best_invalid || pindex->nChainWork > m_best_invalid->nChainWork)) {
+            if (pindex->nStatus & BLOCK_FAILED_MASK && (!m_best_invalid || pindex->nHeight > m_best_invalid->nHeight)) {
                 m_best_invalid = pindex;
             }
             if (pindex->IsValid(BLOCK_VALID_TREE) && (m_best_header == nullptr || CBlockIndexWorkComparator()(m_best_header, pindex)))
@@ -4924,7 +5522,7 @@ void ChainstateManager::CheckBlockIndex()
         assert((pindexFirstNeverProcessed == nullptr) == pindex->HaveNumChainTxs());
         assert((pindexFirstNotTransactionsValid == nullptr) == pindex->HaveNumChainTxs());
         assert(pindex->nHeight == nHeight); // nHeight must be consistent.
-        assert(pindex->pprev == nullptr || pindex->nChainWork >= pindex->pprev->nChainWork); // For every block except the genesis block, the chainwork must be larger than the parent's.
+        assert(pindex->pprev == nullptr || pindex->nHeight >= pindex->pprev->nHeight); // For every block except the genesis block, the chainwork must be larger than the parent's.
         assert(nHeight < 2 || (pindex->pskip && (pindex->pskip->nHeight < nHeight))); // The pskip pointer must point back for all but the first 2 blocks.
         assert(pindexFirstNotTreeValid == nullptr); // All m_blockman.m_block_index entries must at least be TREE valid
         if ((pindex->nStatus & BLOCK_VALID_MASK) >= BLOCK_VALID_TREE) assert(pindexFirstNotTreeValid == nullptr); // TREE valid implies all parents are TREE valid
@@ -5759,7 +6357,6 @@ void ChainstateManager::ResetChainstates()
 static ChainstateManager::Options&& Flatten(ChainstateManager::Options&& opts)
 {
     if (!opts.check_block_index.has_value()) opts.check_block_index = opts.chainparams.DefaultConsistencyChecks();
-    if (!opts.minimum_chain_work.has_value()) opts.minimum_chain_work = UintToArith256(opts.chainparams.GetConsensus().nMinimumChainWork);
     if (!opts.assumed_valid_block.has_value()) opts.assumed_valid_block = opts.chainparams.GetConsensus().defaultAssumeValid;
     Assert(opts.adjusted_time_callback);
     return std::move(opts);
@@ -6025,4 +6622,1191 @@ std::pair<int, int> ChainstateManager::GetPruneRange(const Chainstate& chainstat
     int prune_end = std::min(last_height_can_prune, max_prune);
 
     return {prune_start, prune_end};
+}
+
+void LoadBMMCache()
+{
+    fs::path path = gArgs.GetDataDirNet() / "bmm.dat";
+    CAutoFile filein(fsbridge::fopen(path, "rb"), SER_DISK, CLIENT_VERSION);
+    if (filein.IsNull()) {
+        return;
+    }
+
+    std::vector<uint256> vHashWithdrawal;
+    std::vector<uint256> vHashBMM;
+    std::vector<uint256> vDepositTXID;
+    try {
+        int nVersionRequired, nVersionThatWrote;
+        filein >> nVersionRequired;
+        filein >> nVersionThatWrote;
+        if (nVersionRequired > CLIENT_VERSION) {
+            return;
+        }
+
+        int nWithdrawal = 0;
+        filein >> nWithdrawal;
+        for (int i = 0; i < nWithdrawal; i++) {
+            uint256 hash;
+            filein >> hash;
+            vHashWithdrawal.push_back(hash);
+        }
+        int nBMM = 0;
+        filein >> nBMM;
+        for (int i = 0; i < nBMM; i++) {
+            uint256 hash;
+            filein >> hash;
+            vHashBMM.push_back(hash);
+        }
+        int nDeposit = 0;
+        filein >> nDeposit;
+        for (int i = 0; i < nDeposit; i++) {
+            uint256 hash;
+            filein >> hash;
+            vDepositTXID.push_back(hash);
+        }
+    }
+    catch (const std::exception& e) {
+        LogPrintf("%s: Error reading BMM cache: %s", __func__, e.what());
+        return;
+    }
+
+    for (const uint256& u : vHashWithdrawal) {
+        bmmCache.StoreBroadcastedWithdrawalBundle(u);
+    }
+    for (const uint256& u : vHashBMM) {
+        bmmCache.CacheVerifiedBMM(u);
+    }
+    for (const uint256& u : vDepositTXID) {
+        bmmCache.CacheVerifiedDeposit(u);
+    }
+}
+
+void DumpBMMCache()
+{
+    std::vector<uint256> vHashWithdrawal = bmmCache.GetBroadcastedWithdrawalBundleCache();
+    std::vector<uint256> vHashBMM = bmmCache.GetVerifiedBMMCache();
+    std::vector<uint256> vDepositTXID = bmmCache.GetVerifiedDepositCache();
+
+    int nWithdrawal = vHashWithdrawal.size();
+    int nBMM = vHashBMM.size();
+    int nDeposit = vDepositTXID.size();
+
+    fs::path path = gArgs.GetDataDirNet()/ "bmm.dat.new";
+    CAutoFile fileout(fsbridge::fopen(path, "wb"), SER_DISK, CLIENT_VERSION);
+    if (fileout.IsNull()) {
+        return;
+    }
+
+    try {
+        fileout << 160000; // version required to read: 0.16.00 or later
+        fileout << CLIENT_VERSION; // version that wrote the file
+
+        // Broadcasted Withdrawal Bundle hash cache
+        fileout << nWithdrawal; // Number of Withdrawal Bundle hashes in file
+        for (const uint256& u : vHashWithdrawal) {
+            fileout << u;
+        }
+        // Verified BMM hash cache
+        fileout << nBMM; // Number of Withdrawal Bundle hashes in file
+        for (const uint256& u : vHashBMM) {
+            fileout << u;
+        }
+
+        // Verified deposit txid cache
+        fileout << nDeposit; // Number of Withdrawal Bundle hashes in file
+        for (const uint256& u : vDepositTXID) {
+            fileout << u;
+        }
+
+    }
+    catch (const std::exception& e) {
+        LogPrintf("%s: Error writing BMM cache: %s", __func__, e.what());
+        return;
+    }
+
+    FileCommit(fileout.Get());
+    fileout.fclose();
+
+    bool fDone = RenameOver(gArgs.GetDataDirNet() / "bmm.dat.new", gArgs.GetDataDirNet() / "bmm.dat");
+    if (fDone)
+        LogPrintf("%s: Wrote BMM cache.\n", __func__);
+    else
+        LogPrintf("%s: Failed to write BMM cache.\n", __func__);
+
+}
+
+void LoadMainBlockCache()
+{
+    fs::path path = gArgs.GetDataDirNet() / "mainblockhash.dat";
+    CAutoFile filein(fsbridge::fopen(path, "rb"), SER_DISK, CLIENT_VERSION);
+    if (filein.IsNull()) {
+        return;
+    }
+
+    std::vector<uint256> vHash;
+    try {
+        int nVersionRequired, nVersionThatWrote;
+        filein >> nVersionRequired;
+        filein >> nVersionThatWrote;
+        if (nVersionRequired > CLIENT_VERSION) {
+            return;
+        }
+
+        int count = 0;
+        filein >> count;
+        for (int i = 0; i < count; i++) {
+            uint256 hash;
+            filein >> hash;
+            vHash.push_back(hash);
+        }
+    }
+    catch (const std::exception& e) {
+        LogPrintf("%s: Error reading main block cache: %s", __func__, e.what());
+        return;
+    }
+
+    for (const uint256& u : vHash)
+        bmmCache.CacheMainBlockHash(u);
+}
+
+void DumpMainBlockCache()
+{
+    std::vector<uint256> vHash = bmmCache.GetMainBlockHashCache();
+    if (vHash.empty())
+        return;
+
+    int count = vHash.size();
+
+    fs::path path = gArgs.GetDataDirNet() / "mainblockhash.dat.new";
+    CAutoFile fileout(fsbridge::fopen(path, "wb"), SER_DISK, CLIENT_VERSION);
+    if (fileout.IsNull()) {
+        return;
+    }
+
+    try {
+        fileout << 160000; // version required to read: 0.16.00 or later
+        fileout << CLIENT_VERSION; // version that wrote the file
+        fileout << count; // Number of Withdrawal Bundle hashes in file
+
+        for (const uint256& u : vHash) {
+            fileout << u;
+        }
+    }
+    catch (const std::exception& e) {
+        LogPrintf("%s: Error writing main block cache: %s", __func__, e.what());
+        return;
+    }
+
+    FileCommit(fileout.Get());
+    fileout.fclose();
+
+    bool fDone = RenameOver(gArgs.GetDataDirNet() / "mainblockhash.dat.new", gArgs.GetDataDirNet() / "mainblockhash.dat");
+    if (fDone)
+        LogPrintf("%s: Wrote %u\n", __func__, count);
+    else
+        LogPrintf("%s: Failed to write: %u\n", __func__, count);
+
+}
+
+void DumpWithdrawalIDCache()
+{
+    std::set<uint256> setWithdrawalID = bmmCache.GetCachedWithdrawalID();
+    if (setWithdrawalID.empty())
+        return;
+
+    int count = setWithdrawalID.size();
+
+    fs::path path = gArgs.GetDataDirNet()/ "withdrawalid.dat.new";
+    CAutoFile fileout(fsbridge::fopen(path, "wb"), SER_DISK, CLIENT_VERSION);
+    if (fileout.IsNull()) {
+        return;
+    }
+
+    try {
+        fileout << 160000; // version required to read: 0.16.00 or later
+        fileout << CLIENT_VERSION; // version that wrote the file
+        fileout << count; // Number of Withdrawal IDs in file
+
+        for (const uint256& u : setWithdrawalID) {
+            fileout << u;
+        }
+    }
+    catch (const std::exception& e) {
+        LogPrintf("%s: Error writing Withdrawal ID cache: %s", __func__, e.what());
+        return;
+    }
+
+    FileCommit(fileout.Get());
+    fileout.fclose();
+
+    bool fDone = RenameOver(gArgs.GetDataDirNet()/ "withdrawalid.dat.new", gArgs.GetDataDirNet() / "withdrawalid.dat");
+    if (fDone)
+        LogPrintf("%s: Wrote %u\n", __func__, count);
+    else
+        LogPrintf("%s: Failed to write: %u\n", __func__, count);
+}
+
+void LoadWithdrawalIDCache()
+{
+    fs::path path = gArgs.GetDataDirNet() / "withdrawalid.dat";
+    CAutoFile filein(fsbridge::fopen(path, "rb"), SER_DISK, CLIENT_VERSION);
+    if (filein.IsNull()) {
+        return;
+    }
+
+    std::vector<uint256> vWithdrawalID;
+    try {
+        int nVersionRequired, nVersionThatWrote;
+        filein >> nVersionRequired;
+        filein >> nVersionThatWrote;
+        if (nVersionRequired > CLIENT_VERSION) {
+            return;
+        }
+
+        int count = 0;
+        filein >> count;
+        for (int i = 0; i < count; i++) {
+            uint256 id;
+            filein >> id;
+            vWithdrawalID.push_back(id);
+        }
+    }
+    catch (const std::exception& e) {
+        LogPrintf("%s: Error reading Withdrawal ID cache: %s", __func__, e.what());
+        return;
+    }
+
+    for (const uint256& u : vWithdrawalID)
+        bmmCache.CacheWithdrawalID(u);
+}
+
+/** Create joined Withdrawal Bundle to be sent to the mainchain */
+bool CreateWithdrawalBundleTx(int nHeight, CTransactionRef& withdrawalBundleTx, CTransactionRef& withdrawalBundleDataTx, bool fReplicationCheck, bool fCheckUnique)
+{
+    // Load the latest Withdrawal Bundle
+    bool fHaveWithdrawalBundles = false;
+    uint256 hashLatestWithdrawalBundle;
+    SidechainWithdrawalBundle withdrawalBundleLatest;
+    psidechaintree->GetLastWithdrawalBundleHash(hashLatestWithdrawalBundle);
+    if (psidechaintree->GetWithdrawalBundle(hashLatestWithdrawalBundle, withdrawalBundleLatest)) {
+        fHaveWithdrawalBundles = true;
+    }
+
+    // If the last Withdrawal Bundle failed - wait Withdrawal_FAIL_WAIT_PERIOD blocks before creating
+    // a new one.
+    if (fHaveWithdrawalBundles && withdrawalBundleLatest.status == WITHDRAWAL_BUNDLE_FAILED) {
+        if (nHeight - withdrawalBundleLatest.nFailHeight < WITHDRAWAL_BUNDLE_FAIL_WAIT_PERIOD) {
+            LogPrintf("%s: Not enough blocks since last failed Withdrawal Bundle!\n", __func__);
+            return false;
+        }
+    }
+
+    if (!fReplicationCheck) {
+        if (fHaveWithdrawalBundles) {
+            if (withdrawalBundleLatest.status == WITHDRAWAL_BUNDLE_CREATED) {
+                LogPrintf("%s: Current Withdrawal Bundle for this sidechain still pending!\n", __func__);
+                return false;
+            }
+            // Check for existing Withdrawal Bundle in mainchain SCDB for this sidechain
+            SidechainClient client;
+            std::vector<uint256> vHashWithdrawalBundle;
+            if (client.ListWithdrawalBundleStatus(vHashWithdrawalBundle)) {
+                LogPrintf("%s: Mainchain SCDB already tracking Withdrawal Bundle for this sidechain\n", __func__);
+                return false;
+            }
+        }
+    }
+
+    // Get Withdrawal(s) from psidechaintree
+    std::vector<SidechainWithdrawal> vWithdrawal = psidechaintree->GetWithdrawals(THIS_SIDECHAIN);
+    if (vWithdrawal.empty()) {
+        LogPrintf("%s: No withdrawals(s) to create bundle!\n", __func__);
+        return false;
+    }
+
+    // Select only Withdrawals with Withdrawal_UNSPENT status
+    SelectUnspentWithdrawal(vWithdrawal);
+
+    // Sort Withdrawals by mainchain fee amount
+    SortWithdrawalByFee(vWithdrawal);
+
+
+    if (!fReplicationCheck && vWithdrawal.size() < SIDECHAIN_MIN_WITHDRAWAL) {
+        LogPrintf("%s: Not enough Withdrawal(s) to create Withdrawal Bundle\n", __func__);
+        return false;
+    }
+
+    // Withdrawal Bundle database object for psidechaintree (sidechain only)
+    SidechainWithdrawalBundle withdrawalBundle;
+    withdrawalBundle.nSidechain = THIS_SIDECHAIN;
+
+    CMutableTransaction wjtx; // Withdrawal Bundle
+
+    // Add SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST OP_RETURN output
+    wjtx.vout.push_back(CTxOut(0, CScript() << OP_RETURN << ParseHex(HexStr(SIDECHAIN_WITHDRAWAL_BUNDLE_RETURN_DEST))));
+
+    // Add a dummy output for mainchain fee encoding (updated later)
+    CAmount amountMainchainFees = 0;
+    wjtx.vout.push_back(CTxOut(0, CScript() << OP_RETURN << CScriptNum(1LL << 40)));
+
+    wjtx.nVersion = 2;
+    wjtx.vin.resize(1); // Dummy vin for serialization...
+    wjtx.vin[0].scriptSig = CScript() << OP_0;
+    for (const SidechainWithdrawal& withdrawal : vWithdrawal) {
+        CAmount amountWithdrawal = withdrawal.amount - withdrawal.mainchainFee;
+
+        amountMainchainFees += withdrawal.mainchainFee;
+
+        // TODO check IsValidDestination
+        // Output to mainchain keyID
+        CTxDestination dest = DecodeDestination(withdrawal.strDestination);
+        wjtx.vout.push_back(CTxOut(amountWithdrawal, GetScriptForDestination(dest)));
+
+        // Add Withdrawal objid to Withdrawal Bundle obj
+        withdrawalBundle.vWithdrawalID.push_back(withdrawal.GetID());
+
+        // Make sure we have room for more outputs
+        if (GetTransactionWeight(CTransaction(wjtx)) > MAX_WITHDRAWAL_BUNDLE_WEIGHT) {
+            // If we went over size, undo this output and stop
+            withdrawalBundle.vWithdrawalID.pop_back();
+            wjtx.vout.pop_back();
+
+            // Also remove added fees
+            amountMainchainFees -= withdrawal.mainchainFee;
+
+            break;
+        }
+    }
+
+    // Update mainchain fee encoding output.
+    wjtx.vout[1].scriptPubKey = EncodeWithdrawalFees(amountMainchainFees);
+
+    // Did anything make it into the Withdrawal Bundle?
+    if (!wjtx.vout.size()) {
+        LogPrintf("%s: ERROR: Withdrawal Bundle empty!\n", __func__);
+        return false;
+    }
+
+    // If the Withdrawal Bundle hash will be the same as a previous Withdrawal Bundle return false. It is
+    // possible for a new Withdrawal Bundle to have the same hash as a previous Withdrawal Bundle if all of
+    // the outputs (destinations & amounts) are exactly the same. In that case,
+    // wait for a new Withdrawal to be added to the database so that this Withdrawal Bundle will have
+    // a unique hash. It would also be possible to remove one of the outputs to
+    // obtain a unique Withdrawal Bundle hash (TODO?)
+    if (fCheckUnique && psidechaintree->HaveWithdrawalBundle(wjtx.GetHash())) {
+        LogPrintf("%s: ERROR: Withdrawal Bundle is not unique!\n", __func__);
+        return false;
+    }
+
+    // TODO
+    // Check that the Withdrawal Bundle is valid by mainchain policy
+    //CFeeRate dust = CFeeRate(DUST_RELAY_TX_FEE);
+    //std::string strReason = "";
+    //if (!IsStandardTx(CTransaction(wjtx), true, dust, strReason)) {
+    //    LogPrintf("%s: ERROR: Withdrawal Bundle failed core standardness tests! Reason: %s\n", __func__, strReason);
+    //    return false;
+    //}
+
+    // Add Withdrawal Bundle transaction to the Withdrawal Bundle database object
+    withdrawalBundle.tx = wjtx;
+
+    // Return the Withdrawal Bundle transaction itself by reference
+    withdrawalBundleTx = MakeTransactionRef(wjtx);
+
+    // Output data
+    CMutableTransaction mtx;
+    mtx.vout.push_back(CTxOut(0, withdrawalBundle.GetScript()));
+
+    // Return the Withdrawal Bundle data transaction by reference
+    withdrawalBundleDataTx = MakeTransactionRef(mtx);
+
+    LogPrintf("%s: Withdrawal Bundle created! Hash: %s\n", __func__, wjtx.GetHash().ToString());
+    return true;
+}
+
+bool VerifyWithdrawalBundles(std::string& strFail, int nHeight, const std::vector<CTransactionRef>& vtx, std::vector<SidechainWithdrawal>& vWithdrawal, uint256& hashWithdrawalBundle, uint256& hashWithdrawalBundleID, bool fReplicate) {
+    // Keep track of how many Withdrawal Bundle(s) are in the block, only 1 is allowed
+    int nWithdrawalBundle = 0;
+
+    // Loop through the blocks txns and look for Withdrawal Bundle(s) to verify
+    CAmount amountMainchainFees = 0;
+    for (const CTransactionRef& tx : vtx) {
+        for (const CTxOut& txout : tx->vout) {
+            const CScript& scriptPubKey = txout.scriptPubKey;
+
+            std::vector<unsigned char> vch;
+            if (!scriptPubKey.IsSidechainObj(vch))
+                continue;
+
+            SidechainObj *obj = ParseSidechainObj(vch);
+            if (!obj)  {
+                strFail = "Invalid sidechain obj!\n";
+                return false;
+            }
+
+            if (obj->sidechainop != DB_SIDECHAIN_WITHDRAWAL_BUNDLE_OP)
+                continue;
+
+            nWithdrawalBundle++;
+            if (nWithdrawalBundle > 1) {
+                strFail = "Invalid Withdrawal Bundle - multiple in block!\n";
+                return false;
+            }
+
+            const SidechainWithdrawalBundle *withdrawalBundle = (const SidechainWithdrawalBundle *) obj;
+
+            // Check that every Withdrawal this Withdrawal Bundle has listed is in the db
+            // and verify the status is not spent.
+            for (const uint256& id : withdrawalBundle->vWithdrawalID) {
+                SidechainWithdrawal withdrawal;
+
+                if (!psidechaintree->GetWithdrawal(id, withdrawal)) {
+                    strFail = "Invalid withdrawal - does not exist!\n";
+                    return false;
+                }
+                if (withdrawal.status != WITHDRAWAL_UNSPENT) {
+                    strFail = "Invalid withdrawal - spent!\n";
+                    return false;
+                }
+
+                amountMainchainFees += withdrawal.mainchainFee;
+
+                vWithdrawal.push_back(withdrawal);
+            }
+
+            // Check that there are actually enough outputs for this to be valid
+            if (withdrawalBundle->tx.vout.size() < 3) {
+                strFail = "Invalid Withdrawal Bundle - too few outputs!\n";
+                return false;
+            }
+
+            // Check that the number of outputs equals the number of
+            // Withdrawal(s) listed in the Withdrawal Bundle + one encoded mainchain fee output + one
+            // encoded change return dest output
+            if (withdrawalBundle->tx.vout.size() != vWithdrawal.size() + 2) {
+                strFail = "Invalid Withdrawal Bundle - missing / extra outputs!\n";
+                return false;
+            }
+
+            // Check that the amount in the encoded mainchain fee output is
+            // equal to the sum of fees from the withdrawals
+            CAmount amountRead = 0;
+            if (!DecodeWithdrawalFees(withdrawalBundle->tx.vout[1].scriptPubKey, amountRead)) {
+                strFail = "Invalid Withdrawal Bundle - failed to decode mainchain fee output!\n";
+                return false;
+            }
+
+            if (amountRead != amountMainchainFees) {
+                strFail = "Invalid Withdrawal Bundle - invalid encoded mainchain fee output!\n";
+                return false;
+            }
+
+            // Check that every Withdrawal listed in the Withdrawal Bundle is included
+            for (const SidechainWithdrawal& w : vWithdrawal) {
+                bool fFound = false;
+                for (const CTxOut& out : withdrawalBundle->tx.vout) {
+                    if (out.nValue == w.amount - w.mainchainFee &&
+                            GetScriptForDestination(DecodeDestination(w.strDestination)) == out.scriptPubKey) {
+                        fFound = true;
+                        break;
+                    }
+                }
+                if (!fFound) {
+                    strFail = "Invalid Withdrawal Bundle - missing output!\n";
+                    return false;
+                }
+            }
+
+            // TODO
+            // Check if standard by mainchain bitcoin core standards
+            //CFeeRate dust = CFeeRate(DUST_RELAY_TX_FEE);
+            //std::string strReason = "";
+            //if (!CoreIsStandardTx(withdrawalBundle->tx, true, dust, strReason)) {
+            //    strFail = "Invalid Withdrawal Bundle - failed CoreIsStandardTx!\n";
+            //    return false;
+            //}
+
+            // Check Withdrawal Bundle weight
+            if (GetTransactionWeight(CTransaction(withdrawalBundle->tx)) > MAX_WITHDRAWAL_BUNDLE_WEIGHT) {
+                strFail = "Invalid Withdrawal Bundle - too large!\n";
+                return false;
+            }
+
+            // Verify that we can replicate this Withdrawal Bundle if fReplicate is set
+            if (fReplicate) {
+                // Try to create the same Withdrawal Bundle
+                CTransactionRef withdrawalBundleTx;
+                CTransactionRef withdrawalBundleDataTx;
+                if (!CreateWithdrawalBundleTx(nHeight, withdrawalBundleTx, withdrawalBundleDataTx, true /* fReplicationCheck */ )) {
+                    strFail = "Invalid Withdrawal Bundle - failed to create replicant Withdrawal Bundle!\n";
+                    return false;
+                }
+                // Verify that our Withdrawal Bundle matches the one in this block
+                if (*withdrawalBundleTx != CTransaction(withdrawalBundle->tx)) {
+                    strFail = "Invalid Withdrawal Bundle - replicated Withdrawal Bundle does not match!\n";
+                    return false;
+                }
+            }
+
+            hashWithdrawalBundle = withdrawalBundle->tx.GetHash();
+            hashWithdrawalBundleID = withdrawalBundle->GetID();
+
+            // Update the status of withdrawals included in the Withdrawal Bundle - returned by
+            // reference and applied to the DB if needed
+            for (size_t i = 0; i < vWithdrawal.size(); i++)
+                vWithdrawal[i].status = WITHDRAWAL_IN_BUNDLE;
+        }
+    }
+    if (!hashWithdrawalBundle.IsNull()) {
+        std::string strReplicated = fReplicate ? "true" : "false";
+        LogPrintf("%s Verified Withdrawal Bundle: %s.\n Replicated? %s\n", __func__, hashWithdrawalBundle.ToString(), strReplicated);
+    }
+    return true;
+}
+
+bool SortDeposits(const std::vector<SidechainDeposit>& vDeposit, std::vector<SidechainDeposit>& vDepositSorted)
+{
+    if (vDeposit.empty())
+        return true;
+
+    if (vDeposit.size() == 1) {
+        vDepositSorted = vDeposit;
+        return true;
+    }
+
+    // Find the first deposit in the list by looking for the deposit which
+    // spends a CTIP not in the list. There can only be one. We are also going
+    // to check that there is only one missing CTIP input here.
+    int nMissingCTIP = 0;
+    for (size_t x = 0; x < vDeposit.size(); x++) {
+        const SidechainDeposit dx = vDeposit[x];
+
+        // Look for the input of this deposit
+        bool fFound = false;
+        for (size_t y = 0; y < vDeposit.size(); y++) {
+            const SidechainDeposit dy = vDeposit[y];
+
+            // The CTIP output of the deposit that might be the input
+            const COutPoint prevout(dy.dtx.GetHash(), dy.nBurnIndex);
+
+            // Look for the CTIP output
+            for (const CTxIn& in : dx.dtx.vin) {
+                if (in.prevout == prevout) {
+                    fFound = true;
+                    break;
+                }
+            }
+            if (fFound)
+                break;
+        }
+
+        // If we didn't find the CTIP input, this should be the first and only
+        // deposit without one.
+        if (!fFound) {
+            nMissingCTIP++;
+            if (nMissingCTIP > 1) {
+                LogPrintf("%s: Error: Multiple missing CTIP!\n", __func__);
+                return false;
+            }
+            // Add the first deposit to the result
+            vDepositSorted.push_back(dx);
+            // We found the first deposit but do not stop the loop here
+            // because we are also checking to make sure there aren't any
+            // other deposits missing a CTIP input from the list.
+        }
+    }
+
+    // Now that we know which deposit is first in the list we can add the rest
+    // in CTIP spend order.
+
+    if (vDepositSorted.empty()) {
+        LogPrintf("%s: Error: Coult not find first deposit in list!\n", __func__);
+        return false;
+    }
+
+    // Track the CTIP output of the latest deposit we have sorted
+    COutPoint prevout(vDepositSorted.back().dtx.GetHash(), vDepositSorted.back().nBurnIndex);
+
+    // Look for the deposit that spends the last sorted CTIP output and sort it.
+    // If we cannot find a deposit spending the CTIP, that should mean we
+    // reached the end of sorting.
+    std::vector<SidechainDeposit>::const_iterator it = vDeposit.begin();
+    while (it != vDeposit.end()) {
+        bool fFound = false;
+        for (const CTxIn& in : it->dtx.vin) {
+            if (in.prevout == prevout) {
+                // Add the sorted deposit to the list
+                vDepositSorted.push_back(*it);
+
+                // Update the CTIP output we are looking for
+                const SidechainDeposit deposit = vDepositSorted.back();
+                prevout = COutPoint(deposit.dtx.GetHash(), deposit.nBurnIndex);
+
+                // Start from begin() again
+                fFound = true;
+                it = vDeposit.begin();
+
+                break;
+            }
+        }
+        if (!fFound)
+            it++;
+    }
+
+    if (vDeposit.size() != vDepositSorted.size()) {
+        LogPrintf("%s: Error: Invalid result size! In: %u Out: %u\n", __func__,
+                vDeposit.size(), vDepositSorted.size());
+        return false;
+    }
+
+    // Double check proper CTIP UTXO ordering.
+    // Loop backwards keeping track of the previous value and verify that the
+    // r-next item in the vector is the CTIP input for the previous value.
+    std::vector<SidechainDeposit>::const_reverse_iterator rit;
+    rit = vDepositSorted.rbegin();
+    SidechainDeposit prev;
+    for (; rit != vDepositSorted.rend(); rit++) {
+        // For the last element in the list we track the value and move on
+        if (rit == vDepositSorted.rbegin())  {
+            prev = *rit;
+            continue;
+        }
+
+        // Check if the r-next item is the CTIP for the previous deposit
+        bool fFound = false;
+        for (const CTxIn& in : prev.dtx.vin) {
+            if (in.prevout.hash == rit->dtx.GetHash()
+                && rit->dtx.vout.size() > in.prevout.n
+                && rit->nBurnIndex == in.prevout.n) {
+                fFound = true;
+                break;
+            }
+        }
+        if (!fFound) {
+            LogPrintf("%s: Error: Deposit in sorted list (not first) missing CTIP! Deposit: \n%s\n", __func__, rit->ToString());
+            return false;
+        }
+        // Update the previous object to this index before moving to r-next
+        prev = *rit;
+    }
+
+    return true;
+}
+
+bool CheckMainchainConnection()
+{
+    SidechainClient client;
+
+    int nMainchainBlocks = 0;
+    if (!client.GetBlockCount(nMainchainBlocks)) {
+        LogPrintf("%s: Mainchain connection not detected!\n", __func__);
+        return false;
+    }
+
+    return true;
+}
+
+void SetNetworkActive(bool fActive, const std::string& strReason)
+{
+    // TODO
+    /*
+    if (!m_blockman.connman)
+        return;
+
+    bool fCurrentState = g_connman->GetNetworkActive();
+    if (fActive == fCurrentState)
+        return;
+
+    node.connman->SetNetworkActive(fActive);
+
+    LogPrintf("%s: Network activity set to: %s\n", __func__, fActive ? "Enabled" : "Disabled");
+    if (strReason.size()) {
+        LogPrintf("Reason for network activity change: %s\n", strReason);
+    }
+
+    if (!fActive) {
+        LogPrintf("If you are using the GUI please follow prompts on screen about mainchain connection!\n");
+        LogPrintf("If you are running the daemon check mainchain & sidechain configuration files.\n");
+        LogPrintf("To retry connection, use the 'refreshbmm' RPC command.\n");
+    }
+    */
+}
+
+bool UpdateMainBlockHashCache(bool& fReorg, std::vector<uint256>& vDisconnected)
+{
+    std::lock_guard<std::mutex> lock(mainBlockCacheMutex);
+
+    //
+    // Note: bitcoin core does not count genesis block towards block count but
+    // we will cache it.
+    //
+
+    SidechainClient client;
+
+    // Get the current mainchain block height
+    int nMainBlocks = 0;
+    if (!client.GetBlockCount(nMainBlocks)) {
+        LogPrintf("%s: Failed to update - cannot get block count from mainchain. (connection issue?)\n", __func__);
+        return false;
+    }
+
+    uint256 hashMainTip;
+    if (!client.GetBlockHash(nMainBlocks, hashMainTip)) {
+        LogPrintf("%s: Failed to get to mainchain tip block hash!\n", __func__);
+        return false;
+    }
+
+    uint256 hashCachedTip = bmmCache.GetLastMainBlockHash();
+
+    // If the block height hasn't changed, check that if cached chain tip is the
+    // same as the current mainchain tip. If it is we don't need to do anything
+    // else. If it isn't we will continue to update / reorg handling.
+    int nCachedBlocks = bmmCache.GetCachedBlockCount();
+    if (nMainBlocks + 1 == nCachedBlocks && hashCachedTip == hashMainTip) {
+        return true;
+    }
+
+    // Otherwise;
+    // From the new mainchain tip, start looping back through mainchain blocks
+    // while keeping track of them in order until we find one that connects to
+    // one of our cached blocks by prevblock.
+    uint256 hashPrevBlock;
+    std::deque<uint256> deqHashNew;
+    for (int i = nMainBlocks; i > 0; i--) {
+        // Get the prevblockhash
+        if (!client.GetBlockHash(i - 1, hashPrevBlock)) {
+            LogPrintf("%s: Failed to get to mainchain block: %u\n", __func__, i - 1);
+            return false;
+        }
+
+        // Check if the prevblock is in our cache. Once we find a prevblock in
+        // our cache we can update our cache from that block up to the new
+        // mainchain tip.
+        if (bmmCache.HaveMainBlock(hashPrevBlock)) {
+            deqHashNew.push_front(hashPrevBlock);
+            break;
+        }
+
+        deqHashNew.push_front(hashPrevBlock);
+    }
+    // Also add the new mainchain tip
+    deqHashNew.push_back(hashMainTip);
+
+    return bmmCache.UpdateMainBlockCache(deqHashNew, fReorg, vDisconnected);
+}
+
+bool VerifyMainBlockCache(std::string& strError)
+{
+    SidechainClient client;
+
+    const std::vector<uint256> vHash = bmmCache.GetMainBlockHashCache();
+    if (!vHash.size()) {
+        strError = "No mainchain blocks in cache!";
+        return false;
+    }
+
+    // Compare cached hash at height with mainchain block hash at height
+    for (size_t i = 0; i < vHash.size(); i++) {
+        uint256 hashBlock;
+
+        if (!client.GetBlockHash(i, hashBlock)) {
+            strError = "Failed to request mainchain block hash!";
+            return false;
+        }
+
+        if (hashBlock != vHash[i]) {
+            strError = "Invalid hash cached: ";
+            strError += vHash[i].ToString();
+            strError += " height: ";
+            strError += std::to_string(i);
+
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void HandleMainchainReorg(const std::vector<uint256>& vOrphan)
+{
+    // TODO update & move
+    /*
+    std::lock_guard<std::mutex> lock(mainBlockCacheReorgMutex);
+
+    // For mainchain blocks that were orphaned - invalidate bmm blocks with
+    // commitments from them.
+    //
+    // vOrphan contains a list of mainchain block hashes that were orphaned
+
+    // Before invalidating any blocks, check the sanity of the mainchain block
+    // cache and then verify that the blocks to be orphaned actually are missing
+    // from the mainchain.
+
+    // Check the mainchain block cache
+    std::string strError = "";
+    if (!VerifyMainBlockCache(strError)) {
+        LogPrintf("%s: Main block cache invalid: %s. Resyncing...\n",
+                __func__, strError);
+        // Reset the mainchain block cache and then re-sync it
+        bmmCache.ResetMainBlockCache();
+
+        // TODO
+        // If during this call a reorg is detected and we have more orphans then
+        // something bad happened and needs to be handled. Since we just reset
+        // the mainchain block cache, have a mutex lock, and are updating the
+        // cache from scratch now, it should be impossible.
+        bool fReorg = false;
+        std::vector<uint256> vOrphanIgnore;
+        if (!UpdateMainBlockHashCache(fReorg, vOrphanIgnore)) {
+            // TODO
+            // If we make it to this point there might be a connection issue or
+            // something going on. Maybe the mainchain node went down during the
+            // function? There might be something better to do than just logging
+            // the error here.
+            LogPrintf("%s: Failed to re-update main block cache after reset!",
+                    __func__);
+            return;
+        }
+    }
+
+    // Check that the alleged orphans actually don't exist on the mainchain
+    std::vector<uint256> vOrphanFinal;
+    for (const uint256& u : vOrphan) {
+        if (!bmmCache.HaveMainBlock(u))
+            vOrphanFinal.push_back(u);
+    }
+
+    // Check if any BMM blocks were created from commitments in this
+    // orphaned mainchain block
+    for (const uint256& u : vOrphanFinal) {
+        BlockValidationState state;
+        {
+            LOCK(cs_main);
+            // Check our map of blocks based on their mainchain BMM commit block
+            if (!mapBlockMainHashIndex.count(u))
+                continue;
+
+            CBlockIndex* pindex = mapBlockMainHashIndex[u];
+            if (!m_chain.Contains(pindex))
+                continue;
+
+            InvalidateBlock(state, pindex);
+
+            LogPrintf("%s: Invalidated block: %s because mainchain block: %s was orphaned!\n",
+                    __func__, pindex->GetBlockHash().ToString(), u.ToString());
+
+            if (!state.IsValid()) {
+                LogPrintf("%s: Error while invalidating blocks: %s\n",
+                        __func__, FormatStateMessage(state));
+                return;
+            }
+        }
+
+        ActivateBestChain(state, Params());
+        if (!state.IsValid()) {
+            LogPrintf("%s: Error activating best chain: %s\n",
+                    __func__, FormatStateMessage(state));
+            return;
+        }
+    }
+*/
+}
+
+CScript EncodeWithdrawalFees(const CAmount& amount)
+{
+    CDataStream s(SER_NETWORK, PROTOCOL_VERSION);
+    s << amount;
+
+    SerializeData data(s.begin(), s.end());
+
+    CScript script;
+    script.resize(2 + data.size());
+    script[0] = OP_RETURN;
+    script[1] = data.size();
+    memcpy(&script[2], data.data(), data.size());
+
+    return script;
+}
+
+bool DecodeWithdrawalFees(const CScript& script, CAmount& amount)
+{
+    if (script[0] != OP_RETURN || script.size() != 10) {
+        LogPrintf("%s: Error: Invalid script!\n", __func__);
+        return false;
+    }
+
+    CScript::const_iterator it = script.begin() + 1;
+    std::vector<unsigned char> vch;
+    opcodetype opcode;
+
+    if (!script.GetOp(it, opcode, vch)) {
+        LogPrintf("%s: Error: GetOp failed!\n", __func__);
+        return false;
+    }
+
+    if (vch.empty()) {
+        LogPrintf("%s: Error: Amount bytes empty!\n", __func__);
+        return false;
+    }
+
+    if (vch.size() > 8) {
+        LogPrintf("%s: Error: Amount bytes too large!\n", __func__);
+        return false;
+    }
+
+    try {
+        CDataStream ds(vch, SER_NETWORK, PROTOCOL_VERSION);
+        ds >> amount;
+    } catch (const std::exception&) {
+        LogPrintf("%s: Error: Failed to deserialize amount!\n", __func__);
+        return false;
+    }
+
+    return true;
+}
+
+uint256 GetWithdrawalRefundMessageHash(const uint256& id)
+{
+    // Standard format of refund request message
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << strRefundMessageMagic;
+    ss << id.ToString();
+
+    return ss.GetHash();
+}
+
+CScript GenerateWithdrawalBundleFailCommit(const uint256& hashWithdrawalBundle)
+{
+    /*
+     * Generate a script commit indicating that the Withdrawal Bundle failed on the mainchain
+     */
+
+    CScript scriptPubKey;
+
+    // Add script header
+    scriptPubKey.resize(37);
+    scriptPubKey[0] = OP_RETURN;
+    scriptPubKey[1] = 0xFA;
+    scriptPubKey[2] = 0x86;
+    scriptPubKey[3] = 0xC6;
+    scriptPubKey[4] = 0x89;
+
+    // Add Withdrawal Bundle hash
+    memcpy(&scriptPubKey[5], hashWithdrawalBundle.begin(), 32);
+
+    return scriptPubKey;
+}
+
+CScript GenerateWithdrawalBundleSpentCommit(const uint256& hashWithdrawalBundle)
+{
+    /*
+     * Generate a script commit indicating that the Withdrawal Bundle was spent by mainchain
+     */
+
+    CScript scriptPubKey;
+
+    // Add script header
+    scriptPubKey.resize(37);
+    scriptPubKey[0] = OP_RETURN;
+    scriptPubKey[1] = 0xFB;
+    scriptPubKey[2] = 0x53;
+    scriptPubKey[3] = 0x45;
+    scriptPubKey[4] = 0xDE;
+
+    // Add Withdrawal Bundle hash
+    memcpy(&scriptPubKey[5], hashWithdrawalBundle.begin(), 32);
+
+    return scriptPubKey;
+}
+
+CScript GenerateWithdrawalRefundRequest(const uint256& id, const std::vector<unsigned char>& vchSig)
+{
+    /*
+     * Generate a script commit indicating that the Withdrawal Bundle failed on the mainchain
+     */
+
+    CScript scriptPubKey;
+
+    // Add script header
+    scriptPubKey.resize(102);
+    scriptPubKey[0] = OP_RETURN;
+    scriptPubKey[1] = 0xFC;
+    scriptPubKey[2] = 0xD2;
+    scriptPubKey[3] = 0xE5;
+    scriptPubKey[4] = 0x46;
+
+    // Add Withdrawal ID (the ID it has in ldb)
+    memcpy(&scriptPubKey[5], id.begin(), 32);
+
+    // Add vchSig
+    memcpy(&scriptPubKey[37], vchSig.data(), 65);
+
+    return scriptPubKey;
+}
+
+CScript GeneratePrevBlockCommit(const uint256& hashPrevMain, const uint256& hashPrevSide)
+{
+    /*
+     * Generate a script commit of previous mainchain & sidechain block hashes
+     */
+
+    CScript scriptPubKey;
+
+    // Add script header
+    scriptPubKey.resize(69);
+    scriptPubKey[0] = OP_RETURN;
+    scriptPubKey[1] = 0xFD;
+    scriptPubKey[2] = 0x7A;
+    scriptPubKey[3] = 0xD1;
+    scriptPubKey[4] = 0xEF;
+
+    // Add previous mainchain & previous sidechain block hash
+    memcpy(&scriptPubKey[5], hashPrevMain.begin(), 32);
+    memcpy(&scriptPubKey[37], hashPrevSide.begin(), 32);
+
+    return scriptPubKey;
+}
+
+CScript GenerateWithdrawalBundleHashCommit(const uint256& hashWithdrawalBundle)
+{
+    /*
+     * Generate a script commit of current Withdrawal Bundle hash
+     */
+
+    CScript scriptPubKey;
+
+    // Add script header
+    scriptPubKey.resize(37);
+    scriptPubKey[0] = OP_RETURN;
+    scriptPubKey[1] = 0xEF;
+    scriptPubKey[2] = 0x5D;
+    scriptPubKey[3] = 0x1D;
+    scriptPubKey[4] = 0xFE;
+
+    // Add Withdrawal Bundle hash
+    memcpy(&scriptPubKey[5], hashWithdrawalBundle.begin(), 32);
+
+    return scriptPubKey;
+}
+
+CScript GenerateBlockVersionCommit(const int32_t nVersion)
+{
+    /*
+     * Generate a script commit of block version
+     */
+
+    CScript scriptPubKey;
+
+    // Add script header
+    scriptPubKey.resize(9);
+    scriptPubKey[0] = OP_RETURN;
+    scriptPubKey[1] = 0xA7;
+    scriptPubKey[2] = 0xE6;
+    scriptPubKey[3] = 0x7E;
+    scriptPubKey[4] = 0x1F;
+
+    CScriptNum num(nVersion);
+    std::vector<unsigned char> vch = num.getvch();
+
+    // Add version
+    memcpy(&scriptPubKey[5], vch.data(), 4);
+
+    return scriptPubKey;
+}
+
+bool VerifyWithdrawalRefundRequest(const uint256& id, const std::vector<unsigned char>& vchSig, SidechainWithdrawal& withdrawal)
+{
+    if (id.IsNull()) {
+        LogPrintf("%s: Null Withdrawal ID!\n", __func__);
+        return false;
+    }
+    if (vchSig.size() != 65) {
+        LogPrintf("%s: Invalid signature size!\n", __func__);
+        return false;
+    }
+
+    // Regenerate standard refund message & get hash
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << strRefundMessageMagic;
+    //ss << id.ToString();
+
+    // Recover the public key that signed the refund request
+    CPubKey pubkey;
+    if (!pubkey.RecoverCompact(ss.GetHash(), vchSig)) {
+        LogPrintf("%s: Failed to recover pubkey!\n", __func__);
+        return false;
+    }
+
+    // Lookup & verify status of Withdrawal
+    if (!psidechaintree->GetWithdrawal(id, withdrawal)) {
+        LogPrintf("%s: Withdrawal not found!\n", __func__);
+        return false;
+    }
+    // Check status of Withdrawal
+    if (withdrawal.status != WITHDRAWAL_UNSPENT) {
+        LogPrintf("%s: Withdrawal status != Withdrawal_UNSPENT\n", __func__);
+        return false;
+    }
+    // Verify refund address matches the one recreated from signature
+    //if (DecodeDestination(withdrawal.strRefundDestination) != CTxDestination(PKHash(pubkey.GetID()))) {
+    //    LogPrintf("%s: Refund address does not match signature!\n", __func__);
+    //    return false;
+    //}
+
+    return true;
+}
+
+bool VerifyDeposit(const uint256& hashMainBlock, const uint256& txid, const int nTx)
+{
+    if (hashMainBlock.IsNull()) {
+        return false;
+    }
+    if (txid.IsNull()) {
+        return false;
+    }
+
+    // Have we already verified the deposit?
+    if (bmmCache.HaveVerifiedDeposit(txid))
+        return true;
+
+    SidechainClient client;
+    if (!client.VerifyDeposit(hashMainBlock, txid, nTx)) {
+        return false;
+    }
+
+    // Cache that we have verified the deposit
+    bmmCache.CacheVerifiedDeposit(txid);
+
+    return true;
+}
+
+bool VerifyBMM(const CBlock& block)
+{
+    // Skip genesis block
+    if (block.GetHash() == Params().GetConsensus().hashGenesisBlock)
+        return true;
+
+    // Have we already verified BMM for this block?
+    if (bmmCache.HaveVerifiedBMM(block.GetHash()))
+        return true;
+
+    // h*
+    const uint256 hashMerkleRoot = block.hashMerkleRoot;
+
+    // TODO
+    // Return results from client to help decide on DoS score
+
+    // Verify BMM with local mainchain node
+    uint256 txid;
+    uint32_t nTime;
+    SidechainClient client;
+    if (!client.VerifyBMM(block.hashMainchainBlock, hashMerkleRoot, txid, nTime)) {
+        LogPrintf("%s: Did not find BMM h*: %s in mainchain block: %s!\n", __func__, hashMerkleRoot.ToString(), block.hashMainchainBlock.ToString());
+        return false;
+    }
+
+    // Cache that we have verified BMM for this block
+    bmmCache.CacheVerifiedBMM(block.GetHash());
+
+    return true;
 }

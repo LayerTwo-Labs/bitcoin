@@ -20,6 +20,16 @@
 
 class COutPoint;
 class uint256;
+class SidechainObj;
+class SidechainDeposit;
+class SidechainTransfer;
+class SidechainWithdrawal;
+class SidechainWithdrawalBundle;
+
+namespace Consensus {
+struct Params;
+};
+struct bilingual_str;
 
 //! -dbcache default (MiB)
 static const int64_t nDefaultDbCache = 450;
@@ -75,6 +85,49 @@ public:
 
     //! @returns filesystem path to on-disk storage or std::nullopt if in memory.
     std::optional<fs::path> StoragePath() { return m_db->StoragePath(); }
+};
+
+/** Access to the block database (blocks/index/) */
+class CBlockTreeDB : public CDBWrapper
+{
+public:
+    using CDBWrapper::CDBWrapper;
+    bool WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*> >& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo);
+    bool ReadBlockFileInfo(int nFile, CBlockFileInfo &info);
+    bool ReadLastBlockFile(int &nFile);
+    bool WriteReindexing(bool fReindexing);
+    void ReadReindexing(bool &fReindexing);
+    bool WriteFlag(const std::string &name, bool fValue);
+    bool ReadFlag(const std::string &name, bool &fValue);
+    bool LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&, const uint256&)> insertBlockIndex)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+};
+
+std::optional<bilingual_str> CheckLegacyTxindex(CBlockTreeDB& block_tree_db);
+
+/** Access to the sidechain database (blocks/sidechain/) */
+class CSidechainTreeDB : public CDBWrapper
+{
+public:
+    CSidechainTreeDB(size_t nCacheSize, bool fMemory = false, bool fWipe = false);
+    bool WriteSidechainIndex(const std::vector<std::pair<uint256, const SidechainObj *> > &list);
+    bool WriteWithdrawalUpdate(const std::vector<SidechainWithdrawal>& vWithdrawal);
+    bool WriteWithdrawalBundleUpdate(const SidechainWithdrawalBundle& withdrawalBundle);
+    bool WriteLastWithdrawalBundleHash(const uint256& hash);
+
+    bool GetWithdrawal(const uint256 & /* Withdrawal ID */, SidechainWithdrawal &withdrawal);
+    bool GetWithdrawalBundle(const uint256 & /* Withdrawal Bundle ID */, SidechainWithdrawalBundle &withdrawalBundle);
+    bool GetDeposit(const uint256 & /* Deposit ID */, SidechainDeposit &deposit);
+    bool HaveDeposits();
+    bool HaveDepositNonAmount(const uint256& hashNonAmount);
+    bool GetLastDeposit(SidechainDeposit& deposit);
+    bool GetLastWithdrawalBundleHash(uint256& hash);
+
+    bool HaveWithdrawalBundle(const uint256& hashWithdrawalBundle) const;
+
+    std::vector<SidechainWithdrawal> GetWithdrawals(const uint8_t & /* nSidechain */);
+    std::vector<SidechainWithdrawalBundle> GetWithdrawalBundles(const uint8_t & /* nSidechain */);
+    std::vector<SidechainDeposit> GetDeposits(const uint8_t & /* nSidechain */);
 };
 
 #endif // BITCOIN_TXDB_H

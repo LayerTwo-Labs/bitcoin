@@ -26,15 +26,17 @@ public:
     uint256 hashPrevBlock;
     uint256 hashMerkleRoot;
     uint32_t nTime;
-    uint32_t nBits;
-    uint32_t nNonce;
+
+    // BMM header contents
+    uint256 hashWithdrawalBundle;
+    uint256 hashMainchainBlock;
 
     CBlockHeader()
     {
         SetNull();
     }
 
-    SERIALIZE_METHODS(CBlockHeader, obj) { READWRITE(obj.nVersion, obj.hashPrevBlock, obj.hashMerkleRoot, obj.nTime, obj.nBits, obj.nNonce); }
+    SERIALIZE_METHODS(CBlockHeader, obj) { READWRITE(obj.nVersion, obj.hashPrevBlock, obj.hashMerkleRoot, obj.nTime, obj.hashWithdrawalBundle, obj.hashMainchainBlock); }
 
     void SetNull()
     {
@@ -42,13 +44,13 @@ public:
         hashPrevBlock.SetNull();
         hashMerkleRoot.SetNull();
         nTime = 0;
-        nBits = 0;
-        nNonce = 0;
+        hashMainchainBlock.SetNull();
+        hashWithdrawalBundle.SetNull();
     }
 
     bool IsNull() const
     {
-        return (nBits == 0);
+        return (hashMainchainBlock.IsNull() && hashWithdrawalBundle.IsNull());
     }
 
     uint256 GetHash() const;
@@ -104,8 +106,8 @@ public:
         block.hashPrevBlock  = hashPrevBlock;
         block.hashMerkleRoot = hashMerkleRoot;
         block.nTime          = nTime;
-        block.nBits          = nBits;
-        block.nNonce         = nNonce;
+        block.hashWithdrawalBundle  = hashWithdrawalBundle;
+        block.hashMainchainBlock    = hashMainchainBlock;
         return block;
     }
 

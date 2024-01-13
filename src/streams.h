@@ -216,7 +216,6 @@ public:
         return std::string{UCharCast(data()), UCharCast(data() + size())};
     }
 
-
     //
     // Vector subset
     //

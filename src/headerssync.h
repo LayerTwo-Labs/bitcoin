@@ -23,8 +23,8 @@ struct CompressedHeader {
     int32_t nVersion{0};
     uint256 hashMerkleRoot;
     uint32_t nTime{0};
-    uint32_t nBits{0};
-    uint32_t nNonce{0};
+    uint256 hashMainchainBlock;
+    uint256 hashWithdrawalBundle;
 
     CompressedHeader()
     {
@@ -36,8 +36,8 @@ struct CompressedHeader {
         nVersion = header.nVersion;
         hashMerkleRoot = header.hashMerkleRoot;
         nTime = header.nTime;
-        nBits = header.nBits;
-        nNonce = header.nNonce;
+        hashMainchainBlock = header.hashMainchainBlock;
+        hashWithdrawalBundle = header.hashWithdrawalBundle;
     }
 
     CBlockHeader GetFullHeader(const uint256& hash_prev_block) {
@@ -45,9 +45,8 @@ struct CompressedHeader {
         ret.nVersion = nVersion;
         ret.hashPrevBlock = hash_prev_block;
         ret.hashMerkleRoot = hashMerkleRoot;
-        ret.nTime = nTime;
-        ret.nBits = nBits;
-        ret.nNonce = nNonce;
+        ret.hashMainchainBlock = hashMainchainBlock;
+        ret.hashWithdrawalBundle = hashWithdrawalBundle;
         return ret;
     };
 };
@@ -124,9 +123,6 @@ public:
     /** Return the block timestamp of the last header received during the PRESYNC phase. */
     uint32_t GetPresyncTime() const { return m_last_header_received.nTime; }
 
-    /** Return the amount of work in the chain received during the PRESYNC phase. */
-    arith_uint256 GetPresyncWork() const { return m_current_chain_work; }
-
     /** Construct a HeadersSyncState object representing a headers sync via this
      *  download-twice mechanism).
      *
@@ -136,7 +132,7 @@ public:
      * minimum_required_work: amount of chain work required to accept the chain
      */
     HeadersSyncState(NodeId id, const Consensus::Params& consensus_params,
-            const CBlockIndex* chain_start, const arith_uint256& minimum_required_work);
+            const CBlockIndex* chain_start);
 
     /** Result data structure for ProcessNextHeaders. */
     struct ProcessingResult {
@@ -217,12 +213,6 @@ private:
     /** Store the last block in our block index that the peer's chain builds from */
     const CBlockIndex* m_chain_start{nullptr};
 
-    /** Minimum work that we're looking for on this chain. */
-    const arith_uint256 m_minimum_required_work;
-
-    /** Work that we've seen so far on the peer's chain */
-    arith_uint256 m_current_chain_work;
-
     /** m_hasher is a salted hasher for making our 1-bit commitments to headers we've seen. */
     const SaltedTxidHasher m_hasher;
 
@@ -261,9 +251,6 @@ private:
      * processing.
      */
     uint256 m_redownload_buffer_first_prev_hash;
-
-    /** The accumulated work on the redownloaded chain. */
-    arith_uint256 m_redownload_chain_work;
 
     /** Set this to true once we encounter the target blockheader during phase
      * 2 (REDOWNLOAD). At this point, we can process and store all remaining

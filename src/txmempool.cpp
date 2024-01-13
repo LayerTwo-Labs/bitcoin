@@ -488,6 +488,12 @@ void CTxMemPool::addUnchecked(const CTxMemPoolEntry &entry, setEntries &setAnces
         entry.GetTxSize(),
         entry.GetFee()
     );
+
+    // Keep track of Withdrawalrefunds
+    if (entry.IsWithdrawalRefund()) {
+        setWithdrawalRefund.insert(entry.GetWITHDRAWALID());
+    }
+
 }
 
 void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason)
@@ -525,6 +531,11 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason)
             vTxHashes.shrink_to_fit();
     } else
         vTxHashes.clear();
+
+    // If we are removing a Withdrawalrefund request, also remove the WithdrawalID from set
+    if (it->IsWithdrawalRefund()) {
+        setWithdrawalRefund.erase(it->GetWITHDRAWALID());
+    }
 
     totalTxSize -= it->GetTxSize();
     m_total_fee -= it->GetFee();
