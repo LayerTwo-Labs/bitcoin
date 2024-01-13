@@ -1,7 +1,7 @@
-Bitcoin Core 25.x Drivechain
+Bitcoin Core 26.x Drivechain
 ============================
 
-Bitcoin Core version 25 as a BIP 300 Drivechain with BIP 301 BMM
+Bitcoin Core version 26 as a BIP 300 Drivechain with BIP 301 BMM
 
 BIP 300: https://github.com/bitcoin/bips/blob/master/bip-0300.mediawiki
 
