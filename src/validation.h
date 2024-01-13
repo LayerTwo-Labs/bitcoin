@@ -24,6 +24,7 @@
 #include <policy/packages.h>
 #include <policy/policy.h>
 #include <script/script_error.h>
+#include <script/interpreter.h>
 #include <shutdown.h>
 #include <sidechain.h>
 #include <sync.h>
@@ -326,8 +327,10 @@ private:
     PrecomputedTransactionData *txdata;
 
 public:
+    std::vector<DeferredCheck> m_deferred_checks;
+
     CScriptCheck(const CTxOut& outIn, const CTransaction& txToIn, unsigned int nInIn, unsigned int nFlagsIn, bool cacheIn, PrecomputedTransactionData* txdataIn) :
-        m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn), cacheStore(cacheIn), txdata(txdataIn) { }
+        m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn), cacheStore(cacheIn), txdata(txdataIn), m_deferred_checks() { }
 
     CScriptCheck(const CScriptCheck&) = delete;
     CScriptCheck& operator=(const CScriptCheck&) = delete;

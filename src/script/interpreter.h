@@ -11,6 +11,7 @@
 #include <span.h>
 #include <primitives/transaction.h>
 #include <pubkey.h>
+#include <util/check.h>
 
 #include <optional>
 #include <functional>
@@ -23,6 +24,11 @@ class CScript;
 class CTransaction;
 class CTxOut;
 class uint256;
+
+namespace
+{
+    typedef std::vector<unsigned char> valtype;
+}
 
 /** Signature hash types/flags */
 enum
@@ -155,6 +161,16 @@ enum : uint32_t {
     // Making ANYPREVOUT public key versions (in BIP 342 scripts) non-standard
     SCRIPT_VERIFY_DISCOURAGE_ANYPREVOUT = (1U << 23),
 
+    // OP_VAULT/OP_VAULT_RECOVER validation (BIP xxx)
+    //
+    SCRIPT_VERIFY_VAULT = (1U << 26),
+
+    // Policy: vault recovery transactions should be marked replaceable.
+    SCRIPT_VERIFY_VAULT_REPLACEABLE_RECOVERY = (1U << 27),
+
+    // Policy: unauthorized vault recovery transactions have limited outputs.
+    SCRIPT_VERIFY_VAULT_UNAUTH_RECOVERY_STRUCTURE = (1U << 28),
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER
@@ -233,12 +249,66 @@ enum class KeyVersion
     ANYPREVOUT = 1,  //!< 1 or 33 byte public key, first byte is 0x01
 };
 
+struct DeferredVaultRecoveryCheck
+{
+    //! The recovery value output that should be covering the value of a particular input.
+    unsigned int vout_idx;
+
+    //! An expected constituent amount of the output - note that this isn't the *total*
+    //! expected, but the value required for this specific input.
+    CAmount amount;
+
+    DeferredVaultRecoveryCheck(unsigned int vout_idx, CAmount amount) noexcept
+        : vout_idx(vout_idx), amount(amount) {}
+
+};
+
+struct DeferredVaultTriggerCheck
+{
+    //! The unvault-trigger value output that should be covering the value of a
+    //! particular input.
+    unsigned int vout_idx;
+
+    //! An optional output that includes a revault balance.
+    std::optional<unsigned int> revault_vout_idx;
+
+    CAmount revault_amount;
+
+    //! The amount of the input to cover - NOT the total expected amount of the output.
+    CAmount amount;
+
+    DeferredVaultTriggerCheck(unsigned int vout_idx, std::optional<unsigned int> revault_idx, const CAmount revault_amount, const CAmount amount) noexcept
+        : vout_idx(vout_idx), revault_vout_idx(revault_idx), revault_amount(revault_amount), amount(amount) {}
+};
+
+//! Data that is accumulated during the script verification of a single input and then
+//! used to perform aggregate checks after all inputs have been run through
+//! `VerifyScript()`.
+//!
+//! TODO I realize this is kind of a hacky polymorphic-union thing; if there's a nicer
+//! way to do this, please someone let me know.
+struct DeferredCheck
+{
+    //! Set when script execution happens asynchronously so that we can associate
+    //! deferred checks with their related transaction when a block's worth of
+    //! script executions are performed in batch.
+    const CTransaction* m_tx_to{nullptr};
+
+    std::optional<DeferredVaultRecoveryCheck> m_recov_spend_check{std::nullopt};
+    std::optional<DeferredVaultTriggerCheck> m_vault_trigger_check{std::nullopt};
+};
+
 struct ScriptExecutionData
 {
     //! Whether m_tapleaf_hash is initialized.
     bool m_tapleaf_hash_init = false;
     //! The tapleaf hash.
     uint256 m_tapleaf_hash;
+
+    //! The taproot control block.
+    std::vector<unsigned char> m_taproot_control{};
+    //! The witness version of the currently executing script.
+    std::optional<int> m_curr_witversion;
 
     //! Whether m_codeseparator_pos is initialized.
     bool m_codeseparator_pos_init = false;
@@ -262,6 +332,33 @@ struct ScriptExecutionData
 
     /** The taproot internal key. */
     std::optional<XOnlyPubKey> m_internal_key = std::nullopt;
+
+    //! Accumulate deferred checks during the verification of a single input which
+    //! are then executed after all inputs have been verified with `VerifyScript()`.
+    //! The deferred checks are aggregated and executed in `validation.cpp`.
+    //!
+    //! In practice, this pointer refers to data owned by the `CScriptCheck` instance
+    //! that has created this `ScriptExecutionData` instance.
+    std::vector<DeferredCheck>* m_deferred_checks;
+
+    DeferredCheck& NewDeferredCheck()
+    {
+        Assert(m_deferred_checks)->emplace_back();
+        return m_deferred_checks->back();
+    }
+
+    void AddDeferredVaultRecoveryCheck(unsigned int vout_idx, CAmount amount)
+    {
+        auto& dc = this->NewDeferredCheck();
+        dc.m_recov_spend_check = {vout_idx, amount};
+    }
+
+    void AddDeferredVaultTriggerCheck(
+        unsigned int vout_idx, std::optional<unsigned int> revault_idx, CAmount revault_amount, CAmount amount)
+    {
+        auto& dc = this->NewDeferredCheck();
+        dc.m_vault_trigger_check = {vout_idx, revault_idx, revault_amount, amount};
+    }
 };
 
 /** Signature hash sizes */
@@ -313,6 +410,28 @@ public:
         return false;
     }
 
+    virtual std::optional<ScriptError> CheckVaultRecover(
+        const size_t recovery_vout_idx,
+        ScriptExecutionData& execdata,
+        const uint256& expected_recovery_spk_hash,
+        const CScript& executing_script,
+        unsigned int flags) const
+    {
+         return std::nullopt;
+    }
+
+    virtual std::optional<ScriptError> CheckVaultTrigger(
+        ScriptExecutionData& execdata,
+        const size_t trigger_out_idx,
+        const std::optional<size_t> revault_out_idx,
+        const CAmount revault_amount,
+        CScript flu_script_with_data,
+        unsigned int flags,
+        ScriptError* serror) const
+    {
+         return std::nullopt;
+    }
+
     virtual ~BaseSignatureChecker() {}
 };
 
@@ -350,6 +469,20 @@ public:
     bool CheckLockTime(const CScriptNum& nLockTime) const override;
     bool CheckSequence(const CScriptNum& nSequence) const override;
     bool CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const override;
+    std::optional<ScriptError> CheckVaultRecover(
+        const size_t recovery_vout_idx,
+        ScriptExecutionData& execdata,
+        const uint256& expected_recovery_spk_hash,
+        const CScript& executing_script,
+        unsigned int flags) const override;
+    std::optional<ScriptError> CheckVaultTrigger(
+        ScriptExecutionData& execdata,
+        const size_t trigger_out_idx,
+        const std::optional<size_t> revault_out_idx,
+        const CAmount revault_amount,
+        CScript flu_script_with_data,
+        unsigned int flags,
+        ScriptError* serror) const override;
 };
 
 using TransactionSignatureChecker = GenericTransactionSignatureChecker<CTransaction>;
@@ -381,6 +514,28 @@ public:
     {
         return m_checker.CheckSequence(nSequence);
     }
+    std::optional<ScriptError> CheckVaultRecover(
+        const size_t recovery_vout_idx,
+        ScriptExecutionData& execdata,
+        const uint256& expected_recovery_spk_hash,
+        const CScript& executing_script,
+        unsigned int flags) const override
+    {
+        return m_checker.CheckVaultRecover(
+            recovery_vout_idx, execdata, expected_recovery_spk_hash, executing_script, flags);
+    }
+    std::optional<ScriptError> CheckVaultTrigger(
+        ScriptExecutionData& execdata,
+        const size_t trigger_out_idx,
+        const std::optional<size_t> revault_out_idx,
+        const CAmount revault_amount,
+        CScript flu_script_with_data,
+        unsigned int flags,
+        ScriptError* serror) const override
+    {
+        return m_checker.CheckVaultTrigger(
+            execdata, trigger_out_idx, revault_out_idx, revault_amount, flu_script_with_data, flags, serror);
+    }
 };
 
 /** Compute the BIP341 tapleaf hash from leaf version & script. */
@@ -392,9 +547,10 @@ uint256 ComputeTapbranchHash(Span<const unsigned char> a, Span<const unsigned ch
  *  Requires control block to have valid length (33 + k*32, with k in {0,1,..,128}). */
 uint256 ComputeTaprootMerkleRoot(Span<const unsigned char> control, const uint256& tapleaf_hash);
 
+
 bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* error = nullptr);
-bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* error = nullptr);
-bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror = nullptr);
+bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* error = nullptr, std::vector<DeferredCheck>* deferred_check = nullptr);
+bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror = nullptr, std::vector<DeferredCheck>* deferred_checks = nullptr);
 
 size_t CountWitnessSigOps(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, unsigned int flags);
 
