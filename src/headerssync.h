@@ -22,13 +22,15 @@ struct CompressedHeader {
     // header
     int32_t nVersion{0};
     uint256 hashMerkleRoot;
-    uint32_t nTime{0};
     uint256 hashMainchainBlock;
     uint256 hashWithdrawalBundle;
+    uint32_t nTime{0};
 
     CompressedHeader()
     {
         hashMerkleRoot.SetNull();
+        hashMainchainBlock.SetNull();
+        hashWithdrawalBundle.SetNull();
     }
 
     CompressedHeader(const CBlockHeader& header)
@@ -36,8 +38,8 @@ struct CompressedHeader {
         nVersion = header.nVersion;
         hashMerkleRoot = header.hashMerkleRoot;
         nTime = header.nTime;
-        hashMainchainBlock = header.hashMainchainBlock;
-        hashWithdrawalBundle = header.hashWithdrawalBundle;
+        hashMainchainBlock = header.hashMainchainBlock ;
+        hashWithdrawalBundle = header.hashWithdrawalBundle ;
     }
 
     CBlockHeader GetFullHeader(const uint256& hash_prev_block) {
@@ -47,6 +49,7 @@ struct CompressedHeader {
         ret.hashMerkleRoot = hashMerkleRoot;
         ret.hashMainchainBlock = hashMainchainBlock;
         ret.hashWithdrawalBundle = hashWithdrawalBundle;
+        ret.nTime = nTime;
         return ret;
     };
 };
