@@ -26,7 +26,6 @@
 #include <sidechainclient.h>
 #include <timedata.h>
 #include <util/moneystr.h>
-#include <util/system.h>
 #include <txdb.h>
 #include <validation.h>
 

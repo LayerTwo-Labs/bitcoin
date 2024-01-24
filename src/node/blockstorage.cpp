@@ -14,7 +14,6 @@
 #include <kernel/chainparams.h>
 #include <kernel/messagestartchars.h>
 #include <logging.h>
-#include <pow.h>
 #include <reverse_iterator.h>
 #include <signet.h>
 #include <streams.h>
@@ -93,7 +92,7 @@ bool BlockTreeDB::ReadFlag(const std::string& name, bool& fValue)
     return true;
 }
 
-bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&)> insertBlockIndex, const util::SignalInterrupt& interrupt)
+bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&, const uint256&)> insertBlockIndex, const util::SignalInterrupt& interrupt)
 {
     AssertLockHeld(::cs_main);
     std::unique_ptr<CDBIterator> pcursor(NewIterator());
@@ -107,8 +106,10 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
             CDiskBlockIndex diskindex;
             if (pcursor->GetValue(diskindex)) {
                 // Construct block index object
-                CBlockIndex* pindexNew = insertBlockIndex(diskindex.ConstructBlockHash());
-                pindexNew->pprev          = insertBlockIndex(diskindex.hashPrev);
+                // // TODO insert mainblock hash here
+                // TODO
+                CBlockIndex* pindexNew; // = insertBlockIndex(diskindex.ConstructBlockHash());
+                // TODO pindexNew->pprev          = insertBlockIndex(diskindex.hashPrev);
                 pindexNew->nHeight        = diskindex.nHeight;
                 pindexNew->nFile          = diskindex.nFile;
                 pindexNew->nDataPos       = diskindex.nDataPos;
@@ -116,14 +117,8 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->nVersion       = diskindex.nVersion;
                 pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
                 pindexNew->nTime          = diskindex.nTime;
-                pindexNew->nBits          = diskindex.nBits;
-                pindexNew->nNonce         = diskindex.nNonce;
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
-
-                if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
-                    return error("%s: CheckProofOfWork failed: %s", __func__, pindexNew->ToString());
-                }
 
                 pcursor->Next();
             } else {
@@ -389,9 +384,10 @@ CBlockIndex* BlockManager::InsertBlockIndex(const uint256& hash, const uint256& 
 
 bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockhash)
 {
-    if (!m_block_tree_db->LoadBlockIndexGuts(consensus_params, [this](const uint256& hash, const uint256& hashMainBlock) EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return this->InsertBlockIndex(hash, hashMainBlock); })) {
-        return false;
-    }
+    // TODO
+    //if (!m_block_tree_db->LoadBlockIndexGuts(GetParams(), [this](const uint256& hash, const uint256& hashMainBlock) EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return this->InsertBlockIndex(hash, hashMainBlock); })) {
+    //    return false;
+    //}
 
     if (snapshot_blockhash) {
         const std::optional<AssumeutxoData> maybe_au_data = GetParams().AssumeutxoForBlockhash(*snapshot_blockhash);

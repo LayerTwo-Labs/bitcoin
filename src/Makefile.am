@@ -451,7 +451,7 @@ libbitcoin_node_a_SOURCES = \
   rpc/net.cpp \
   rpc/node.cpp \
   rpc/output_script.cpp \
-  rpc/rawtransaction.cpp \
+  # TODO rpc/rawtransaction.cpp \
   rpc/server.cpp \
   rpc/server_util.cpp \
   rpc/signmessage.cpp \

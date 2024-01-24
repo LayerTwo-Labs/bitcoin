@@ -2608,9 +2608,11 @@ UniValue CreateUTXOSnapshot(
     return result;
 }
 
+
 static RPCHelpMan refreshbmm()
 {
-    return RPCHelpMan{"refreshbmm",
+    return RPCHelpMan{
+        "refreshbmm",
         "Refresh automated BMM. Basic testing implementation.\n",
         {
             {"amount", RPCArg::Type::NUM, RPCArg::Optional::NO, "Amount to pay mainchain miner for including BMM request."},
@@ -2628,11 +2630,18 @@ static RPCHelpMan refreshbmm()
                 {RPCResult::Type::NUM, "nfees", ""},
                 {RPCResult::Type::STR, "txid", ""},
                 {RPCResult::Type::STR, "error", ""},
-            }},
+            }
+        },
         RPCExamples{
             HelpExampleCli("refreshbmm", "")
-            + HelpExampleRpc("refreshbmm", "")
+            + HelpExampleRpc("refreshbmm", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
     LOCK(cs_main);
+
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+
     Chainstate& active_chainstate = chainman.ActiveChainstate();
 
     CTxMemPool& mempool = EnsureMemPool(node);
@@ -2747,7 +2756,6 @@ return RPCHelpMan{
 
         data.pushKV("blocks",                (int)chain.Height());
         data.pushKV("bestblockhash",         tip->GetBlockHash().GetHex());
-        data.pushKV("difficulty",            (double)GetDifficulty(tip));
         data.pushKV("verificationprogress",  GuessVerificationProgress(Params().TxData(), tip));
         data.pushKV("coins_db_cache_bytes",  cs.m_coinsdb_cache_size_bytes);
         data.pushKV("coins_tip_cache_bytes", cs.m_coinstip_cache_size_bytes);
@@ -2887,7 +2895,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &scanblocks},
         {"blockchain", &getblockfilter},
         {"blockchain", &dumptxoutset},
-        {"blockchain", &loadtxoutset},
+        //{"blockchain", &loadtxoutset},
         {"blockchain", &getchainstates},
         {"hidden", &invalidateblock},
         {"hidden", &reconsiderblock},

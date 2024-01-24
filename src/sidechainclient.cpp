@@ -8,6 +8,7 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <core_io.h>
+#include <common/args.h>
 #include <node/miner.h>
 #include <sidechain.h>
 #include <streams.h>
@@ -16,7 +17,7 @@
 #include <univalue.h>
 #include <util/moneystr.h>
 #include <util/strencodings.h>
-#include <util/system.h>
+#include <logging.h>
 
 #include <iostream>
 #include <sstream>

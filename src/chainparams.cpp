@@ -109,8 +109,12 @@ const CChainParams &Params() {
 std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, const ChainType chain)
 {
     switch (chain) {
+    case ChainType::TESTNET:
     case ChainType::MAIN:
+    case ChainType::REGTEST:
+    case ChainType::SIGNET:
         return CChainParams::Main();
+        /*
     case ChainType::TESTNET:
         return CChainParams::TestNet();
     case ChainType::SIGNET: {
@@ -123,6 +127,7 @@ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, c
         ReadRegTestArgs(args, opts);
         return CChainParams::RegTest(opts);
     }
+        */
     }
     assert(false);
 }

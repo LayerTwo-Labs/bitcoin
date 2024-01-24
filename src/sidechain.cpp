@@ -19,6 +19,8 @@ const uint32_t nVersion = 1;
 
 uint256 SidechainObj::GetHash(void) const
 {
+    // TODO re-implement core deleted SerializeHash function
+    /*
     uint256 ret;
     if (sidechainop == DB_SIDECHAIN_WITHDRAWAL_OP)
         ret = SerializeHash(*(SidechainWithdrawal *) this);
@@ -30,6 +32,8 @@ uint256 SidechainObj::GetHash(void) const
         ret = SerializeHash(*(SidechainDeposit *) this);
 
     return ret;
+    */
+    return uint256();
 }
 
 std::string SidechainObj::ToString(void) const

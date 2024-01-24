@@ -366,12 +366,6 @@ bool TestBlockValidity(BlockValidationState& state,
                        bool fCheckBMM = false,
                        bool fReorg = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
-/** Check with the proof of work on each blockheader matches the value in nBits */
-bool HasValidProofOfWork(const std::vector<CBlockHeader>& headers, const Consensus::Params& consensusParams);
-
-/** Return the sum of the work on a given set of headers */
-arith_uint256 CalculateHeadersWork(const std::vector<CBlockHeader>& headers);
-
 enum class VerifyDBResult {
     SUCCESS,
     CORRUPTED_BLOCK_DB,
@@ -1176,7 +1170,7 @@ public:
      *
      * @returns   False if the block or header is invalid, or if saving to disk fails (likely a fatal error); true otherwise.
      */
-    bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     void ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 

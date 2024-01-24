@@ -1565,7 +1565,7 @@ uint256 GetSpentScriptsSHA256(const std::vector<CTxOut>& outputs_spent)
 template <class T>
 uint256 GetScriptSigsSHA256(const T& txTo)
 {
-    CHashWriter ss(SER_GETHASH, 0);
+    CHashWriter ss(SER_DISK);
     for (const auto& in : txTo.vin) {
         ss << in.scriptSig;
     }
@@ -1576,7 +1576,7 @@ uint256 GetScriptSigsSHA256(const T& txTo)
 template<typename TxType>
 uint256 GetDefaultCheckTemplateVerifyHashWithScript(const TxType& tx, const uint256& outputs_hash, const uint256& sequences_hash,
                                 const uint256& scriptSig_hash, const uint32_t input_index) {
-    auto h = CHashWriter(SER_GETHASH, 0)
+    auto h = CHashWriter(SER_DISK)
         << tx.nVersion
         << tx.nLockTime
         << scriptSig_hash
@@ -1591,7 +1591,7 @@ uint256 GetDefaultCheckTemplateVerifyHashWithScript(const TxType& tx, const uint
 template<typename TxType>
 uint256 GetDefaultCheckTemplateVerifyHashEmptyScript(const TxType& tx, const uint256& outputs_hash, const uint256& sequences_hash,
                                 const uint32_t input_index) {
-    auto h = CHashWriter(SER_GETHASH, 0)
+    auto h = CHashWriter(SER_DISK)
         << tx.nVersion
         << tx.nLockTime
         << uint32_t(tx.vin.size())

@@ -245,7 +245,7 @@ PartiallySignedTransaction ProcessPSBT(const std::string& psbt_string, const std
         // Note that SignPSBTInput does a lot more than just constructing ECDSA signatures.
         // We only actually care about those if our signing provider doesn't hide private
         // information, as is the case with `descriptorprocesspsbt`
-        SignPSBTInput(provider, psbtx, /*index=*/i, &txdata, sighash_type, /*out_sigdata=*/nullptr, finalize);
+        // TODO SignPSBTInput(provider, psbtx, /*index=*/i, &txdata, sighash_type, /*out_sigdata=*/nullptr, finalize);
     }
 
     // Update script/keypath information using descriptor data.
@@ -557,7 +557,7 @@ static RPCHelpMan decodescript()
         case TxoutType::SCRIPTHASH:
         case TxoutType::WITNESS_UNKNOWN:
         case TxoutType::WITNESS_V1_TAPROOT:
-        case TxoutType::TX_BARE_DEFAULT_CHECK_TEMPLATE_VERIFY_HASH:
+        // TODO case TxoutType::TX_BARE_DEFAULT_CHECK_TEMPLATE_VERIFY_HASH:
             // Should not be wrapped
             return false;
         } // no default case, so the compiler can warn about missing cases
@@ -600,7 +600,7 @@ static RPCHelpMan decodescript()
             case TxoutType::WITNESS_V0_KEYHASH:
             case TxoutType::WITNESS_V0_SCRIPTHASH:
             case TxoutType::WITNESS_V1_TAPROOT:
-            case TxoutType::TX_BARE_DEFAULT_CHECK_TEMPLATE_VERIFY_HASH:
+            // TODO case TxoutType::TX_BARE_DEFAULT_CHECK_TEMPLATE_VERIFY_HASH:
                 // Should not be wrapped
                 return false;
             } // no default case, so the compiler can warn about missing cases
@@ -1726,7 +1726,8 @@ static RPCHelpMan utxoupdatepsbt()
     // Fill the inputs
     PrecomputedTransactionData txdata = PrecomputePSBTData(psbtx);
     for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
-        PSBTInput& input = psbtx.inputs.at(i);
+        // TODO
+        //PSBTInput& input = psbtx.inputs.at(i);
 
         if (input.non_witness_utxo || !input.witness_utxo.IsNull()) {
             continue;

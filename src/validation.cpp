@@ -19,6 +19,7 @@
 #include <consensus/tx_check.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
+#include <common/args.h>
 #include <core_io.h>
 #include <cuckoocache.h>
 #include <flatfile.h>
@@ -107,8 +108,6 @@ const size_t MAX_WITHDRAWAL_BUNDLE_WEIGHT=(MAX_STANDARD_TX_WEIGHT / WITNESS_SCAL
 
 std::map<uint256, CBlockIndex*> mapBlockMainHashIndex;
 
-/** Maximum kilobytes for transactions to store for processing during reorg */
-static const unsigned int MAX_DISCONNECTED_TX_POOL_SIZE = 20000;
 /** Time to wait between writing blocks/block index to disk. */
 static constexpr std::chrono::hours DATABASE_WRITE_INTERVAL{1};
 /** Time to wait between flushing chainstate to disk. */
@@ -940,9 +939,10 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
 
     // Set entry_sequence to 0 when bypass_limits is used; this allows txs from a block
     // reorg to be marked earlier than any child txs that were already in the mempool.
+    uint256 wtid;
     const uint64_t entry_sequence = bypass_limits ? 0 : m_pool.GetSequence();
-    entry.reset(new CTxMemPoolEntry(ptx, ws.m_base_fees, nAcceptTime, m_active_chainstate.m_chain.Height(), entry_sequence,
-                                    fSpendsCoinbase, fRefund, nSigOpsCost, lock_points.value()));
+    entry.reset(new CTxMemPoolEntry(ptx, ws.m_base_fees, nAcceptTime, m_active_chainstate.m_chain.Height(),
+                                    fSpendsCoinbase, fRefund, wtid, nSigOpsCost, lock_points.value()));
     ws.m_vsize = entry->GetTxSize();
 
     if (nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST)
@@ -1804,9 +1804,6 @@ bool ChainstateManager::IsInitialBlockDownload() const
     }
     CChain& chain{ActiveChain()};
     if (chain.Tip() == nullptr) {
-        return true;
-    }
-    if (chain.Tip()->nChainWork < MinimumChainWork()) {
         return true;
     }
     if (chain.Tip()->Time() < Now<NodeSeconds>() - m_options.max_tip_age) {
@@ -3137,7 +3134,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
              Ticks<SecondsDouble>(time_verify),
              Ticks<MillisecondsDouble>(time_verify) / num_blocks_total);
 
-    if (!m_blockman.WriteUndoDataForBlock(blockundo, state, pindex, params)) {
+    if (!m_blockman.WriteUndoDataForBlock(blockundo, state, *pindex)) {
         return false;
     }
 
@@ -4058,8 +4055,7 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
             // least as much work as where we expect the new tip to end up.
             if (!m_chain.Contains(candidate) &&
                     !CBlockIndexWorkComparator()(candidate, pindex->pprev) &&
-                    candidate->IsValid(BLOCK_VALID_TRANSACTIONS) &&
-                    candidate->HaveTxsDownloaded()) {
+                    candidate->IsValid(BLOCK_VALID_TRANSACTIONS)) {
                 candidate_blocks_by_work.insert(std::make_pair(candidate->nHeight, candidate));
             }
         }
@@ -4467,14 +4463,16 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         }
     }
 
+    // TODO
+    // Buggy with trying to make sidechain block time be a copy of mainchain block time...
     // Check timestamp against prev
-    if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())
-        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "time-too-old", "block's timestamp is too early");
+    //if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())
+    //    return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "time-too-old", "block's timestamp is too early");
 
     // Check timestamp
-    if (block.Time() > now + std::chrono::seconds{MAX_FUTURE_BLOCK_TIME}) {
-        return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new", "block timestamp too far in the future");
-    }
+    //if (block.Time() > now + std::chrono::seconds{MAX_FUTURE_BLOCK_TIME}) {
+    //    return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new", "block timestamp too far in the future");
+    //}
 
     // Reject blocks with outdated version
     if ((block.nVersion < 2 && DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_HEIGHTINCB)) ||
@@ -4696,7 +4694,6 @@ bool ChainstateManager::ProcessNewBlockHeaders(const std::vector<CBlockHeader>& 
         for (const CBlockHeader& header : headers) {
             CBlockIndex *pindex = nullptr; // Use a temp pindex instead of ppindex to avoid a const_cast
             bool accepted{AcceptBlockHeader(header, state, &pindex)};
-            ActiveChainstate().CheckBlockIndex();
 
             if (!accepted) {
                 return false;
@@ -4738,7 +4735,7 @@ void ChainstateManager::ReportHeadersPresync(int64_t height, int64_t timestamp)
 }
 
 /** Store block on disk. If dbp is non-nullptr, the file is known to already reside on disk */
-bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked)
+bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock)
 {
     const CBlock& block = *pblock;
 
@@ -4759,7 +4756,6 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     // measure, unless the blocks have more work than the active chain tip, and
     // aren't too far ahead of it, so are likely to be attached soon.
     bool fAlreadyHave = pindex->nStatus & BLOCK_HAVE_DATA;
-    bool fHasMoreOrSameWork = (m_chain.Tip() ? pindex->nHeight >= m_chain.Tip()->nHeight : true);
     // Blocks that are too out-of-order needlessly limit the effectiveness of
     // pruning, because pruning will not delete block files that contain any
     // blocks which are too close in height to the tip.  Apply this test
@@ -4778,7 +4774,6 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     if (fAlreadyHave) return true;
     if (!fRequested) {  // If we didn't ask for it:
         if (pindex->nTx != 0) return true;    // This is a previously-processed block that was pruned
-        if (!fHasMoreOrSameWork) return true; // Don't process less-work chains
         if (fTooFarAhead) return true;        // Block height is too high
     }
 
@@ -4809,11 +4804,6 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
             return error("%s: invalid Withdrawal Bundle! Error: %s", __func__, strFail);
         }
     }
-
-    // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW
-    // (but if it does not build on our best tip, let the SendMessages loop relay it)
-    if (!fInitialBlockDownload && m_chain.Tip() == pindex->pprev)
-        GetMainSignals().NewPoWValidBlock(pindex, pblock);
 
     // Write block to history file
     if (fNewBlock) *fNewBlock = true;
@@ -6738,7 +6728,7 @@ std::pair<int, int> ChainstateManager::GetPruneRange(const Chainstate& chainstat
 void LoadBMMCache()
 {
     fs::path path = gArgs.GetDataDirNet() / "bmm.dat";
-    CAutoFile filein(fsbridge::fopen(path, "rb"), SER_DISK, CLIENT_VERSION);
+    CAutoFile filein(fsbridge::fopen(path, "rb"), SER_DISK);
     if (filein.IsNull()) {
         return;
     }
@@ -6803,7 +6793,7 @@ void DumpBMMCache()
     int nDeposit = vDepositTXID.size();
 
     fs::path path = gArgs.GetDataDirNet()/ "bmm.dat.new";
-    CAutoFile fileout(fsbridge::fopen(path, "wb"), SER_DISK, CLIENT_VERSION);
+    CAutoFile fileout(fsbridge::fopen(path, "wb"), SER_DISK);
     if (fileout.IsNull()) {
         return;
     }
@@ -6849,7 +6839,7 @@ void DumpBMMCache()
 void LoadMainBlockCache()
 {
     fs::path path = gArgs.GetDataDirNet() / "mainblockhash.dat";
-    CAutoFile filein(fsbridge::fopen(path, "rb"), SER_DISK, CLIENT_VERSION);
+    CAutoFile filein(fsbridge::fopen(path, "rb"), SER_DISK);
     if (filein.IsNull()) {
         return;
     }
@@ -6889,7 +6879,7 @@ void DumpMainBlockCache()
     int count = vHash.size();
 
     fs::path path = gArgs.GetDataDirNet() / "mainblockhash.dat.new";
-    CAutoFile fileout(fsbridge::fopen(path, "wb"), SER_DISK, CLIENT_VERSION);
+    CAutoFile fileout(fsbridge::fopen(path, "wb"), SER_DISK);
     if (fileout.IsNull()) {
         return;
     }
@@ -6928,7 +6918,7 @@ void DumpWithdrawalIDCache()
     int count = setWithdrawalID.size();
 
     fs::path path = gArgs.GetDataDirNet()/ "withdrawalid.dat.new";
-    CAutoFile fileout(fsbridge::fopen(path, "wb"), SER_DISK, CLIENT_VERSION);
+    CAutoFile fileout(fsbridge::fopen(path, "wb"), SER_DISK);
     if (fileout.IsNull()) {
         return;
     }
@@ -6960,7 +6950,7 @@ void DumpWithdrawalIDCache()
 void LoadWithdrawalIDCache()
 {
     fs::path path = gArgs.GetDataDirNet() / "withdrawalid.dat";
-    CAutoFile filein(fsbridge::fopen(path, "rb"), SER_DISK, CLIENT_VERSION);
+    CAutoFile filein(fsbridge::fopen(path, "rb"), SER_DISK);
     if (filein.IsNull()) {
         return;
     }
@@ -7679,7 +7669,7 @@ bool DecodeWithdrawalFees(const CScript& script, CAmount& amount)
 uint256 GetWithdrawalRefundMessageHash(const uint256& id)
 {
     // Standard format of refund request message
-    CHashWriter ss(SER_GETHASH, 0);
+    CHashWriter ss(SER_DISK);
     ss << strRefundMessageMagic;
     ss << id.ToString();
 
@@ -7837,7 +7827,7 @@ bool VerifyWithdrawalRefundRequest(const uint256& id, const std::vector<unsigned
     }
 
     // Regenerate standard refund message & get hash
-    CHashWriter ss(SER_GETHASH, 0);
+    CHashWriter ss(SER_DISK);
     ss << strRefundMessageMagic;
     //ss << id.ToString();
 

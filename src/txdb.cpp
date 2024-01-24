@@ -22,7 +22,7 @@
 #include <iterator>
 #include <utility>
 #include <node/chainstatemanager_args.h>
-#include <util/system.h>
+#include <common/args.h>
 #include <streams.h>
 #include <validation.h>
 
@@ -241,70 +241,6 @@ void CCoinsViewDBCursor::Next()
     } else {
         keyTmp.first = entry.key;
     }
-}
-
-bool CBlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*> >& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo) {
-    CDBBatch batch(*this);
-    for (std::vector<std::pair<int, const CBlockFileInfo*> >::const_iterator it=fileInfo.begin(); it != fileInfo.end(); it++) {
-        batch.Write(std::make_pair(DB_BLOCK_FILES, it->first), *it->second);
-    }
-    batch.Write(DB_LAST_BLOCK, nLastFile);
-    for (std::vector<const CBlockIndex*>::const_iterator it=blockinfo.begin(); it != blockinfo.end(); it++) {
-        batch.Write(std::make_pair(DB_BLOCK_INDEX, (*it)->GetBlockHash()), CDiskBlockIndex(*it));
-    }
-    return WriteBatch(batch, true);
-}
-
-bool CBlockTreeDB::WriteFlag(const std::string &name, bool fValue) {
-    return Write(std::make_pair(DB_FLAG, name), fValue ? uint8_t{'1'} : uint8_t{'0'});
-}
-
-bool CBlockTreeDB::ReadFlag(const std::string &name, bool &fValue) {
-    uint8_t ch;
-    if (!Read(std::make_pair(DB_FLAG, name), ch))
-        return false;
-    fValue = ch == uint8_t{'1'};
-    return true;
-}
-
-bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&, const uint256&)> insertBlockIndex)
-{
-    AssertLockHeld(::cs_main);
-    std::unique_ptr<CDBIterator> pcursor(NewIterator());
-    pcursor->Seek(std::make_pair(DB_BLOCK_INDEX, uint256()));
-
-    // Load m_block_index
-    while (pcursor->Valid()) {
-        if (ShutdownRequested()) return false;
-        std::pair<uint8_t, uint256> key;
-        if (pcursor->GetKey(key) && key.first == DB_BLOCK_INDEX) {
-            CDiskBlockIndex diskindex;
-            if (pcursor->GetValue(diskindex)) {
-                // Construct block index object
-                CBlockIndex* pindexNew = insertBlockIndex(diskindex.ConstructBlockHash(), diskindex.hashMainchainBlock);
-                pindexNew->pprev          = insertBlockIndex(diskindex.hashPrev, diskindex.hashMainchainBlock);
-                pindexNew->nHeight        = diskindex.nHeight;
-                pindexNew->nFile          = diskindex.nFile;
-                pindexNew->nDataPos       = diskindex.nDataPos;
-                pindexNew->nUndoPos       = diskindex.nUndoPos;
-                pindexNew->nVersion       = diskindex.nVersion;
-                pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
-                pindexNew->nTime          = diskindex.nTime;
-                pindexNew->hashWithdrawalBundle = diskindex.hashWithdrawalBundle;
-                pindexNew->hashMainchainBlock = diskindex.hashMainchainBlock;
-                pindexNew->nStatus        = diskindex.nStatus;
-                pindexNew->nTx            = diskindex.nTx;
-
-                pcursor->Next();
-            } else {
-                return error("%s: failed to read value", __func__);
-            }
-        } else {
-            break;
-        }
-    }
-
-    return true;
 }
 
 CSidechainTreeDB::CSidechainTreeDB(size_t nCacheSize, bool fMemory, bool fWipe)

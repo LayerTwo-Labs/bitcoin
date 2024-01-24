@@ -1441,11 +1441,11 @@ bool CreateWithdrawal(CWallet& wallet, const CScript& scriptWithdrawalData, cons
     // TODO merging the burn and data output into one would save space
 
     // Withdrawal burn recipient
-    CRecipient burnRecipient = {CScript() << OP_RETURN, nAmount + nMainchainFee, false};
+    CRecipient burnRecipient; // TODO  = {CScript() << OP_RETURN, nAmount + nMainchainFee, false};
     vSend.push_back(burnRecipient);
 
     // Withdrawal data
-    CRecipient dataRecipient = {scriptWithdrawalData, 0, false};
+    CRecipient dataRecipient; // TODO  = {scriptWithdrawalData, 0, false};
     vSend.push_back(dataRecipient);
 
     // TODO use nFee and set fee amount

@@ -270,9 +270,6 @@ const Out& AsBase(const In& x)
     FORMATTER_METHODS_PARAMS(cls, obj, paramcls, paramobj)
 
 // clang-format off
-#ifndef CHAR_EQUALS_INT8
-template <typename Stream> void Serialize(Stream&, char) = delete; // char serialization forbidden. Use uint8_t or int8_t
-#endif
 template <typename Stream> void Serialize(Stream& s, std::byte a) { ser_writedata8(s, uint8_t(a)); }
 template<typename Stream> inline void Serialize(Stream& s, char a    ) { ser_writedata8(s, a); }
 template<typename Stream> inline void Serialize(Stream& s, int8_t a  ) { ser_writedata8(s, a); }
@@ -288,9 +285,6 @@ template<typename Stream, int N> inline void Serialize(Stream& s, const unsigned
 template <typename Stream, typename B, std::size_t N> void Serialize(Stream& s, const std::array<B, N>& a) { (void)/* force byte-type */UCharCast(a.data()); s.write(MakeByteSpan(a)); }
 template <typename Stream, typename B> void Serialize(Stream& s, Span<B> span) { (void)/* force byte-type */UCharCast(span.data()); s.write(AsBytes(span)); }
 
-#ifndef CHAR_EQUALS_INT8
-template <typename Stream> void Unserialize(Stream&, char) = delete; // char serialization forbidden. Use uint8_t or int8_t
-#endif
 template <typename Stream> void Unserialize(Stream& s, std::byte& a) { a = std::byte{ser_readdata8(s)}; }
 template<typename Stream> inline void Unserialize(Stream& s, char& a    ) { a = ser_readdata8(s); }
 template<typename Stream> inline void Unserialize(Stream& s, int8_t& a  ) { a = ser_readdata8(s); }

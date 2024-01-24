@@ -87,23 +87,24 @@ public:
     std::optional<fs::path> StoragePath() { return m_db->StoragePath(); }
 };
 
-/** Access to the block database (blocks/index/) */
-class CBlockTreeDB : public CDBWrapper
-{
-public:
-    using CDBWrapper::CDBWrapper;
-    bool WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*> >& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo);
-    bool ReadBlockFileInfo(int nFile, CBlockFileInfo &info);
-    bool ReadLastBlockFile(int &nFile);
-    bool WriteReindexing(bool fReindexing);
-    void ReadReindexing(bool &fReindexing);
-    bool WriteFlag(const std::string &name, bool fValue);
-    bool ReadFlag(const std::string &name, bool &fValue);
-    bool LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&, const uint256&)> insertBlockIndex)
-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
-};
 
-std::optional<bilingual_str> CheckLegacyTxindex(CBlockTreeDB& block_tree_db);
+/** Access to the block database (blocks/index/) */
+//class CBlockTreeDB : public CDBWrapper
+//{
+//public:
+//    using CDBWrapper::CDBWrapper;
+//    bool WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*> >& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo);
+//    bool ReadBlockFileInfo(int nFile, CBlockFileInfo &info);
+//    bool ReadLastBlockFile(int &nFile);
+//    bool WriteReindexing(bool fReindexing);
+//    void ReadReindexing(bool &fReindexing);
+//    bool WriteFlag(const std::string &name, bool fValue);
+//    bool ReadFlag(const std::string &name, bool &fValue);
+//    bool LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&, const uint256&)> insertBlockIndex)
+//        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+//};
+
+//std::optional<bilingual_str> CheckLegacyTxindex(CBlockTreeDB& block_tree_db);
 
 /** Access to the sidechain database (blocks/sidechain/) */
 class CSidechainTreeDB : public CDBWrapper
