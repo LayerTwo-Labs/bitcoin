@@ -19,12 +19,12 @@
 #include <vector>
 
 class COutPoint;
-class uint256;
-class SidechainObj;
-class SidechainDeposit;
-class SidechainTransfer;
-class SidechainWithdrawal;
-class SidechainWithdrawalBundle;
+struct uint256;
+struct SidechainObj;
+struct SidechainDeposit;
+struct SidechainTransfer;
+struct SidechainWithdrawal;
+struct SidechainWithdrawalBundle;
 
 namespace Consensus {
 struct Params;
