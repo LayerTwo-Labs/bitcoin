@@ -19,7 +19,7 @@
 #include <vector>
 
 class COutPoint;
-struct uint256;
+class uint256;
 struct SidechainObj;
 struct SidechainDeposit;
 struct SidechainTransfer;
