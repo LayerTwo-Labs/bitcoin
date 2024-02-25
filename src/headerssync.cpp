@@ -26,7 +26,7 @@ static_assert(sizeof(CompressedHeader) == 104);
 HeadersSyncState::HeadersSyncState(NodeId id, const Consensus::Params& consensus_params,
         const CBlockIndex* chain_start) :
     m_commit_offset(GetRand<unsigned>(HEADER_COMMITMENT_PERIOD)),
-    m_id(id), m_consensus_params(consensus_params),
+    m_id(id),
     m_chain_start(chain_start),
     m_last_header_received(m_chain_start->GetBlockHeader()),
     m_current_height(chain_start->nHeight)
